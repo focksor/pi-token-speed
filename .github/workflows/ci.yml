@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: 验证（类型检查 + 加载冒烟 + 打包）
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+
+      # Node 24：原生 TS 类型剥离可直接 node 运行 .ts
+      - name: 安装 Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      # 运行时零依赖：pi 包导入均为 type-only，会被剥离，可直接执行冒烟
+      - name: 加载冒烟测试
+        run: node token-speed.ts
+
+      # devDependencies 不入库，仅在 CI 临时安装用于类型检查
+      - name: TypeScript 严格类型检查
+        run: |
+          npm i --no-save --no-package-lock --no-audit --no-fund \
+            typescript@latest @types/node@latest @earendil-works/pi-coding-agent@latest
+          npx tsc --module nodenext --moduleResolution nodenext --target es2022 \
+            --strict --noEmit --skipLibCheck --types node token-speed.ts
+
+      - name: 打包检查（tarball 内容与体积）
+        run: |
+          npm pack
+          tar tzf focksor-pi-token-speed-*.tgz

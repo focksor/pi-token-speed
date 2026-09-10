@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # 创建 GitHub Release
+  id-token: write   # Trusted Publishing（OIDC）必需
+
+jobs:
+  release:
+    # Trusted Publishing 仅支持 GitHub 托管 runner（self-hosted 不支持）
+    name: 验证并发布（npm + GitHub Release）
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+
+      # Trusted Publishing 要求 npm ≥ 11.5.1；官方示例使用 Node 24，
+      # 且 release 构建禁用包管理器缓存
+      - name: 安装 Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: 校验 npm 支持 Trusted Publishing（需 ≥ 11.5.1）
+        run: |
+          npm_ver="$(npm -v)"
+          echo "当前 npm 版本: $npm_ver"
+          node -e '
+            const [major, minor] = process.argv[1].split(".").map(Number);
+            if (major < 11 || (major === 11 && minor < 5)) {
+              console.error("npm " + process.argv[1] + " 过旧，Trusted Publishing 需要 npm ≥ 11.5.1");
+              process.exit(1);
+            }
+            console.log("npm 版本校验通过");
+          ' "$npm_ver"
+
+      # 运行时零依赖：pi 包导入均为 type-only，会被剥离，可直接执行冒烟
+      - name: 加载冒烟测试
+        run: node token-speed.ts
+
+      # devDependencies 不入库，仅在发布前临时安装用于类型检查
+      - name: TypeScript 严格类型检查
+        run: |
+          npm i --no-save --no-package-lock --no-audit --no-fund \
+            typescript@latest @types/node@latest @earendil-works/pi-coding-agent@latest
+          npx tsc --module nodenext --moduleResolution nodenext --target es2022 \
+            --strict --noEmit --skipLibCheck --types node token-speed.ts
+
+      - name: 校验 tag 与 package.json 版本一致
+        run: |
+          node -e '
+            const version = require("./package.json").version;
+            const tag = process.env.GITHUB_REF_NAME;
+            if (tag !== "v" + version) {
+              console.error("tag " + tag + " 与 package.json 版本 v" + version + " 不一致");
+              process.exit(1);
+            }
+            console.log("tag 校验通过: " + tag);
+          '
+
+      # Trusted Publishing 要求 package.json 的 repository.url 与 GitHub 仓库完全一致
+      - name: 校验 repository.url 与当前仓库一致
+        run: |
+          node -e '
+            const url = require("./package.json").repository.url;
+            const expected = "git+https://github.com/" + process.env.GITHUB_REPOSITORY + ".git";
+            if (url !== expected) {
+              console.error("repository.url (" + url + ") 与 " + expected + " 不一致");
+              process.exit(1);
+            }
+            console.log("repository.url 校验通过: " + url);
+          '
+
+      - name: 打包（产物供 GitHub Release 上传）
+        run: npm pack
+
+      # Trusted Publishing：npm CLI 自动检测 OIDC 环境并认证，无需 NODE_AUTH_TOKEN；
+      # 公开包的 provenance 由 npm 自动生成
+      - name: 发布到 npm（Trusted Publishing / OIDC，无需 token）
+        run: npm publish --access public
+
+      - name: 创建 GitHub Release（自动 release notes + 附 tgz）
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: focksor-pi-token-speed-*.tgz
