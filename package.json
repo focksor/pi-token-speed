@@ -1,0 +1,36 @@
+{
+  "name": "@focksor/pi-token-speed",
+  "version": "1.0.0",
+  "description": "pi extension: show assistant output token speed and TTFT in the footer",
+  "type": "module",
+  "license": "MIT",
+  "author": "focksor <focksor@outlook.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/focksor/pi-token-speed.git"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "extension",
+    "token",
+    "speed",
+    "ttft",
+    "footer"
+  ],
+  "files": [
+    "token-speed.ts"
+  ],
+  "pi": {
+    "extensions": [
+      "./token-speed.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
