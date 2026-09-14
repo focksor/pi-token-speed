@@ -1,7 +1,7 @@
 {
   "name": "@focksor/pi-token-speed",
-  "version": "1.0.1",
-  "description": "pi extension: show assistant output token speed and TTFT in the footer",
+  "version": "1.1.0",
+  "description": "pi extension: show assistant output token speed and TTFT in the footer, aggregated across in-process subagents",
   "type": "module",
   "license": "MIT",
   "author": "focksor <focksor@outlook.com>",
@@ -20,7 +20,9 @@
     "token",
     "speed",
     "ttft",
-    "footer"
+    "footer",
+    "subagents",
+    "global"
   ],
   "files": [
     "token-speed.ts"
