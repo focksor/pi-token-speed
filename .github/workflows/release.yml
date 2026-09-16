@@ -43,6 +43,10 @@ jobs:
       - name: 加载冒烟测试
         run: node token-speed.ts
 
+      # 发布门禁：多会话功能回归（全局聚合 + TTFT 实时等待计时）
+      - name: 功能回归测试
+        run: node test-global.ts
+
       # devDependencies 不入库，仅在发布前临时安装用于类型检查
       - name: TypeScript 严格类型检查
         run: |

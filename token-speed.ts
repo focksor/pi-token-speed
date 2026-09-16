@@ -260,11 +260,29 @@ export default function (pi: ExtensionAPI) {
 			// The main session's own speed is always displayed once measured: live
 			// while streaming, otherwise the last finalized speed — subagent activity
 			// appends to it, never replaces it.
-			const mainSegment = live
-				? awaitingFirstToken
-					? "⚡ ... tok/s · TTFT ..."
-					: `⚡ ${formatSpeed(live.speed)} tok/s · TTFT ${formatLatency(live.ttft ?? Number.NaN)}`
-				: lastFinalMainStatus;
+			let mainSegment: string | undefined;
+			if (live && awaitingFirstToken) {
+				// Live TTFT wait (message started, first token pending): tick the time
+				// since the request was sent — the same anchor the final TTFT is
+				// measured from — so the running number converges exactly to the value
+				// frozen at the first token.
+				const anchor = activeResponse?.requestSentAt ?? pendingRequestSentAt;
+				mainSegment =
+					anchor !== undefined
+						? `⚡ ... tok/s · TTFT ${formatLatency(Math.max(now - anchor, 0))}…`
+						: "⚡ ... tok/s · TTFT ...";
+			} else if (live) {
+				// TTFT is final the moment the first token arrives — show it even during
+				// the speed warmup, where only the speed stays hidden.
+				const speedText = live.speed > 0 ? formatSpeed(live.speed) : "...";
+				mainSegment = `⚡ ${speedText} tok/s · TTFT ${formatLatency(live.ttft ?? Number.NaN)}`;
+			} else if (pendingRequestSentAt !== undefined) {
+				// Live TTFT wait (request in flight, message not started yet): the
+				// network/provider latency before message_start is part of the TTFT.
+				mainSegment = `⚡ ... tok/s · TTFT ${formatLatency(Math.max(now - pendingRequestSentAt, 0))}…`;
+			} else {
+				mainSegment = lastFinalMainStatus;
+			}
 			if (mainSegment && subSegment) status = `${mainSegment} · ${subSegment}`;
 			else if (mainSegment) status = mainSegment;
 			else if (subSegment) status = `⚡ ${subSegment}`;
@@ -276,6 +294,25 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const onStoreChange = () => render(true);
+
+	// Live TTFT wait timer. No pi event fires between the provider request and
+	// the first streamed token, so a timer is the only way to keep the wait
+	// visible: every tick is a forced render of the elapsed time at ~10Hz.
+	let waitTicker: ReturnType<typeof setInterval> | undefined;
+	const stopWaitTicker = () => {
+		if (waitTicker !== undefined) {
+			clearInterval(waitTicker);
+			waitTicker = undefined;
+		}
+	};
+	const startWaitTicker = () => {
+		// Only the UI-owning instance renders; subagent instances must not even
+		// start one — an interval would achieve nothing and keep the process alive.
+		if (latestCtx?.hasUI !== true || waitTicker !== undefined) return;
+		waitTicker = setInterval(() => render(true), LIVE_REFRESH_INTERVAL_MS);
+		// Defense in depth: a leaked interval must never hold the process open.
+		waitTicker.unref?.();
+	};
 
 	/** Merge a patch into this session's store entry and refresh its keepalive. */
 	const touch = (patch: Partial<Omit<SessionEntry, "updatedAt">>) => {
@@ -310,6 +347,7 @@ export default function (pi: ExtensionAPI) {
 		pendingRequestSentAt = undefined;
 		lastLiveRenderAt = -Infinity;
 		lastReportAt = -Infinity;
+		stopWaitTicker();
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -342,6 +380,10 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_provider_request", async (_event, ctx) => {
 		latestCtx = ctx;
 		pendingRequestSentAt = performance.now();
+		// The TTFT wait starts with the request itself: start the live timer and
+		// show the elapsed immediately instead of waiting for message_start.
+		startWaitTicker();
+		render(true);
 	});
 
 	pi.on("message_start", async (event, ctx) => {
@@ -357,6 +399,9 @@ export default function (pi: ExtensionAPI) {
 		live = { tokens: 0, speed: 0, ttft: undefined };
 		awaitingFirstToken = true;
 		touch({ running: true, speed: 0, label: getSessionLabel(pi) });
+		// Defensive: keep the wait timer running even if before_provider_request
+		// was somehow missed (the display anchor falls back to message start).
+		startWaitTicker();
 		render(true);
 		scheduleFlush(store);
 	});
@@ -371,6 +416,10 @@ export default function (pi: ExtensionAPI) {
 		const now = performance.now();
 		if (activeResponse.firstTokenAt === undefined) {
 			activeResponse.firstTokenAt = now;
+			// First token received: the wait is over. Stop the live TTFT timer and
+			// decouple "waiting" from the speed warmup so the final TTFT shows now.
+			stopWaitTicker();
+			awaitingFirstToken = false;
 		}
 		const ttft =
 			activeResponse.requestSentAt !== undefined && activeResponse.firstTokenAt !== undefined
@@ -384,7 +433,6 @@ export default function (pi: ExtensionAPI) {
 		const warmup = now - activeResponse.startedAt < SPEED_WARMUP_MS;
 		const speed = warmup ? 0 : tokensPerSecond(outputTokens, activeResponse.startedAt);
 		live = { tokens: outputTokens, speed, ttft };
-		awaitingFirstToken = warmup;
 
 		// Report and render at most ~10Hz. This gate MUST live outside the render:
 		// UI-less subagent instances would otherwise report every single delta.
@@ -416,6 +464,9 @@ export default function (pi: ExtensionAPI) {
 				: undefined;
 		lastFinalMainStatus = `⚡ ${formatSpeed(speed)} tok/s · TTFT ${formatLatency(ttft ?? Number.NaN)}`;
 
+		// A message can end without ever streaming (empty response): the wait
+		// timer must not outlive it.
+		stopWaitTicker();
 		live = undefined;
 		awaitingFirstToken = false;
 		activeResponse = undefined;
@@ -431,6 +482,11 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_end", async (_event, ctx) => {
 		latestCtx = ctx;
+		// Safety net for failed/aborted requests: they never reach message_*, so
+		// the live TTFT timer is stopped here instead — and the request anchor is
+		// dropped, or later renders would show a frozen wait time.
+		stopWaitTicker();
+		pendingRequestSentAt = undefined;
 		// The agent is done executing — drop it from the count immediately, even
 		// though its session lingers for a while before pi-subagents disposes it.
 		store.sessions.delete(instanceId);

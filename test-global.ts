@@ -128,13 +128,28 @@ await subB.fire("message_update", { message: assistantMessage("y".repeat(800)) }
 await sleep(10);
 expect(main, /⚡ 3 sub · [\d.]+ tok\/s/.test(main.last()), `two streamers aggregate ("${main.last()}")`);
 
-// main streams too: both segments combine.
+// main streams too: both segments combine. The TTFT wait shows a LIVE timer:
+// it starts at before_provider_request (the same anchor the final TTFT is
+// measured from) and ticks with no pi events in between.
 await main.fire("before_provider_request");
+expect(
+	main,
+	/^⚡ \.\.\. tok\/s · TTFT \S+… · 3 sub/.test(main.last() ?? ""),
+	`wait timer starts at before_provider_request ("${main.last()}")`,
+);
+const ticksBefore = main.statusCount();
+await sleep(350);
+const ticksAfter = main.statusCount();
+expect(
+	main,
+	ticksAfter - ticksBefore >= 2 && /^⚡ \.\.\. tok\/s · TTFT \S+… · 3 sub/.test(main.last() ?? ""),
+	`TTFT wait timer ticks with no events (${ticksAfter - ticksBefore} renders in 350ms, "${main.last()}")`,
+);
 await main.fire("message_start", { message: assistantMessage("") });
 expect(
 	main,
-	main.last()?.startsWith("⚡ ... tok/s · TTFT ... · 3 sub"),
-	`main placeholder + sub segment ("${main.last()}")`,
+	/^⚡ \.\.\. tok\/s · TTFT \S+… · 3 sub/.test(main.last() ?? ""),
+	`main wait timer + sub segment ("${main.last()}")`,
 );
 
 // Regression (throttle starvation): after warmup, a sub flush render lands
@@ -148,6 +163,10 @@ expect(
 	/⚡ [\d.]+ tok\/s · TTFT \S+ · 3 sub/.test(main.last()),
 	`main delta renders despite concurrent sub flush ("${main.last()}")`,
 );
+// The live timer must stop at the first token: while idle, no further renders.
+const idleBefore = main.statusCount();
+await sleep(350);
+expect(main, main.statusCount() === idleBefore, "TTFT timer stops after the first token");
 await sleep(1100);
 await main.fire("message_update", { message: assistantMessage("m".repeat(200)) });
 expect(
@@ -193,6 +212,23 @@ expect(
 	!main.last()?.includes("sub") && /⚡ [\d.]+ tok\/s · TTFT \S+/.test(main.last()),
 	`all done: aggregate gone, main final speed persists ("${main.last()}")`,
 );
+
+// abort/error path: a request that never produces a message (agent ends while
+// waiting) must fall back to the persisted final speed — no frozen wait timer,
+// no further ticking.
+await main.fire("before_provider_request");
+await sleep(50);
+await main.fire("agent_end", {});
+await sleep(10);
+const afterAbort = main.last() ?? "";
+expect(
+	main,
+	/⚡ [\d.]+ tok\/s · TTFT \S+$/.test(afterAbort) && !afterAbort.includes("…"),
+	`aborted wait falls back to the final speed ("${afterAbort}")`,
+);
+const abortIdleBefore = main.statusCount();
+await sleep(350);
+expect(main, main.statusCount() === abortIdleBefore, "no ticking after an aborted wait");
 
 // session disposal must not disturb the main footer.
 const before = main.statusCount();

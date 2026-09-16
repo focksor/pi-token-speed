@@ -36,6 +36,11 @@ pi -e ~/workSpace/pi-token-speed/token-speed.ts
 - 响应完成后：优先使用 provider 返回的 `usage.output`，计算准确的输出速度。
 - 速度公式为 `output tokens / assistant 响应总耗时（秒）`，因此包含 TTFT。
 - TTFT（Time To First Token，首字延迟）从 provider 请求发出（`before_provider_request`）计到收到首个流式内容（首次 `message_update`），小于 1 秒显示毫秒，否则显示秒。
+- 请求发出后、首个流式内容到达前，footer 实时刷新等待计时（约 10Hz），锚点与最终 TTFT 相同，等待中的数字会精确收敛到定格值；尾部的 `…` 表示仍在等待，首个 token 到达后计时停止并定格为最终 TTFT：
+
+  ```text
+  ⚡ ... tok/s · TTFT 2.4s…
+  ```
 
 示例：
 
@@ -60,7 +65,7 @@ pi-subagents 把每个 subagent 作为同进程内的独立会话运行，且子
 
 - 主会话自己的速度信息**始终显示**：流式时实时速度+TTFT，空闲时保留最近一次的最终速度；聚合段只是追加在后，不会取代它。新会话还没跑过任何主消息时才可能只显示聚合段。
 - 只剩 1 个 agent 时显示会话名（去掉 pi-subagents 的 `#id` 后缀、超长截断）：`⚡ 28.1 tok/s · TTFT 620ms · sub Explore · 18.0 tok/s`
-- 响应前 1 秒为热身期，速度不计（避免首个大 chunk 除以近乎为 0 的时间产生上千 tok/s 的毛刺）；主会话同样在热身期显示 `...` 占位符。
+- 响应前 1 秒为热身期，速度不计（避免首个大 chunk 除以近乎为 0 的时间产生上千 tok/s 的毛刺）；主会话热身期速度显示 `...`，TTFT 则在首个 token 到达时即定格为真实值，不等热身结束。
 - agent 结束（`agent_end`）后其速度与数量一并移除；会话被丢弃（约 10 分钟后）时自动清理，异常退出的残留由 5 分钟 TTL 兑底。
 
 已知限制：
