@@ -177,6 +177,52 @@ expect(
 await main.fire("message_end", { message: assistantMessage("m".repeat(200)) });
 await sleep(150);
 
+// [persist-shown-speed] main has shown a real speed once, so a NEW request's
+// wait and warmup phases must keep it on screen instead of reverting to "..."
+// (only a session that has never shown a speed displays the placeholder).
+await main.fire("before_provider_request");
+await sleep(10);
+expect(
+	main,
+	/^⚡ [\d.]+ tok\/s · TTFT \S+… · 3 sub/.test(main.last() ?? ""),
+	`second wait keeps the last shown speed, no "..." ("${main.last()}")`,
+);
+await main.fire("message_start", { message: assistantMessage("") });
+await sleep(10);
+expect(
+	main,
+	/^⚡ [\d.]+ tok\/s · TTFT \S+… · 3 sub/.test(main.last() ?? ""),
+	`pre-first-token still shows the last speed with a live TTFT ("${main.last()}")`,
+);
+// [warmup-ramp] the first token also bridges into the new response: right
+// after the TTFT freezes, the warmup shows a conservative provisional rate
+// (tokens over a floored 1s window) that updates LIVE as tokens arrive —
+// instead of sitting on the previous response's stale value until the real
+// average kicks in. 40 chars = 10 tokens / 1s = 10.0 tok/s.
+await main.fire("message_update", { message: assistantMessage("m".repeat(40)) });
+expect(
+	main,
+	/^⚡ 10\.0 tok\/s · TTFT \S+ · 3 sub/.test(main.last() ?? "") && !main.last()?.includes("…"),
+	`first tokens show a live provisional speed right after TTFT ("${main.last()}")`,
+);
+await sleep(110); // pass the ~10Hz report throttle
+await main.fire("message_update", { message: assistantMessage("m".repeat(400)) }); // 100 tokens / 1s
+expect(
+	main,
+	/^⚡ 100 tok\/s /.test(main.last() ?? ""),
+	`provisional speed ramps with arriving tokens ("${main.last()}")`,
+);
+await sleep(1100); // past the warmup: the real since-start average takes over
+await main.fire("message_update", { message: assistantMessage("m".repeat(200)) });
+await sleep(10);
+expect(
+	main,
+	/^⚡ [\d.]+ tok\/s · TTFT \S+ · 3 sub/.test(main.last() ?? ""),
+	`post-warmup shows the fresh live speed ("${main.last()}")`,
+);
+await main.fire("message_end", { message: assistantMessage("m".repeat(200)) });
+await sleep(150);
+
 // [issue 1] agents finish one by one: the executing count shrinks stepwise.
 await subA.fire("agent_end", {});
 await sleep(10);

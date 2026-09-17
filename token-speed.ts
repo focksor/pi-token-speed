@@ -9,7 +9,11 @@ const LIVE_REFRESH_INTERVAL_MS = 100;
  * Since-start averages are meaningless in the first moments of a response: a
  * fat first chunk over a near-zero elapsed (floored at 1ms) computes absurd
  * tok/s values that then decay — and the aggregate sums that spike across
- * agents. Hide the speed until a response has this much history.
+ * agents. Until a response has this much history, the footer shows a
+ * conservative provisional rate (tokens over this floored window) instead:
+ * it updates live as tokens arrive — bridging straight from the frozen TTFT
+ * into the real average, with no dead time — and the floored denominator
+ * bounds it so it can decay, but never spike.
  */
 const SPEED_WARMUP_MS = 1000;
 /** Safety net: drop sessions whose instance stopped reporting without a clean end (crash/kill). */
@@ -225,6 +229,11 @@ export default function (pi: ExtensionAPI) {
 	let live: LiveSpeed | undefined;
 	let awaitingFirstToken = false;
 	let lastFinalMainStatus: string | undefined;
+	/** Last speed displayed in this session (live post-warmup or final). Once a
+	 *  speed has been shown, later TTFT waits and warmups keep it on screen
+	 *  instead of reverting to the "..." placeholder — only a session that has
+	 *  never shown a speed falls back to "...". */
+	let lastShownSpeed: number | undefined;
 	/** Throttle for THIS session's own streaming renders (main only; flushes bypass). */
 	let lastLiveRenderAt = -Infinity;
 	/** Throttle for streaming reports into the store — must also apply to UI-less subagent instances. */
@@ -240,6 +249,14 @@ export default function (pi: ExtensionAPI) {
 	// force=true (store flushes, phase changes) renders immediately and never
 	// advances the streaming throttle — flushes must not starve this session's
 	// own ~10Hz streaming cadence. throttle=true is that cadence.
+
+	/** Speed text for phases without a fresh sample (TTFT wait, warmup): once
+	 *  this session has shown a speed, keep showing it — never revert to "...". */
+	const speedTextFor = (current?: number): string => {
+		const speed = current !== undefined && current > 0 ? current : lastShownSpeed;
+		return speed !== undefined && speed > 0 ? formatSpeed(speed) : "...";
+	};
+
 	const render = (force = false, throttle = false) => {
 		try {
 			const ctx = latestCtx;
@@ -269,17 +286,16 @@ export default function (pi: ExtensionAPI) {
 				const anchor = activeResponse?.requestSentAt ?? pendingRequestSentAt;
 				mainSegment =
 					anchor !== undefined
-						? `⚡ ... tok/s · TTFT ${formatLatency(Math.max(now - anchor, 0))}…`
-						: "⚡ ... tok/s · TTFT ...";
+						? `⚡ ${speedTextFor()} tok/s · TTFT ${formatLatency(Math.max(now - anchor, 0))}…`
+						: `⚡ ${speedTextFor()} tok/s · TTFT ...`;
 			} else if (live) {
 				// TTFT is final the moment the first token arrives — show it even during
 				// the speed warmup, where only the speed stays hidden.
-				const speedText = live.speed > 0 ? formatSpeed(live.speed) : "...";
-				mainSegment = `⚡ ${speedText} tok/s · TTFT ${formatLatency(live.ttft ?? Number.NaN)}`;
+				mainSegment = `⚡ ${speedTextFor(live.speed)} tok/s · TTFT ${formatLatency(live.ttft ?? Number.NaN)}`;
 			} else if (pendingRequestSentAt !== undefined) {
 				// Live TTFT wait (request in flight, message not started yet): the
 				// network/provider latency before message_start is part of the TTFT.
-				mainSegment = `⚡ ... tok/s · TTFT ${formatLatency(Math.max(now - pendingRequestSentAt, 0))}…`;
+				mainSegment = `⚡ ${speedTextFor()} tok/s · TTFT ${formatLatency(Math.max(now - pendingRequestSentAt, 0))}…`;
 			} else {
 				mainSegment = lastFinalMainStatus;
 			}
@@ -354,6 +370,7 @@ export default function (pi: ExtensionAPI) {
 		latestCtx = ctx;
 		resetResponse();
 		lastFinalMainStatus = undefined;
+		lastShownSpeed = undefined;
 		store.renderers.add(onStoreChange);
 		// Alive from now on; pi-subagents names the session before binding
 		// extensions, so the label is already final here.
@@ -430,9 +447,21 @@ export default function (pi: ExtensionAPI) {
 		// forced render (e.g. a flush caused by another session) shows the
 		// CURRENT main-segment values instead of a stale placeholder.
 		const outputTokens = getOutputTokens(message);
-		const warmup = now - activeResponse.startedAt < SPEED_WARMUP_MS;
-		const speed = warmup ? 0 : tokensPerSecond(outputTokens, activeResponse.startedAt);
+		const elapsed = now - activeResponse.startedAt;
+		// The since-start average is not yet meaningful in the first moments (fat
+		// first chunk over near-zero elapsed), but the display must not sit on the
+		// previous response's stale value until warmup ends either. During the
+		// warmup window, show a conservative provisional rate: tokens over a
+		// floored 1s denominator — live-updating so the speed bridges straight
+		// from the frozen TTFT into the real average with no dead time, and
+		// bounded so it can decay but never spike. Continuous by construction:
+		// at the warmup boundary both branches compute tokens / 1s.
+		const speed =
+			elapsed < SPEED_WARMUP_MS
+				? outputTokens / (SPEED_WARMUP_MS / 1000)
+				: tokensPerSecond(outputTokens, activeResponse.startedAt);
 		live = { tokens: outputTokens, speed, ttft };
+		if (speed > 0) lastShownSpeed = speed;
 
 		// Report and render at most ~10Hz. This gate MUST live outside the render:
 		// UI-less subagent instances would otherwise report every single delta.
@@ -462,6 +491,7 @@ export default function (pi: ExtensionAPI) {
 			activeResponse.requestSentAt !== undefined && activeResponse.firstTokenAt !== undefined
 				? activeResponse.firstTokenAt - activeResponse.requestSentAt
 				: undefined;
+		if (speed > 0) lastShownSpeed = speed;
 		lastFinalMainStatus = `⚡ ${formatSpeed(speed)} tok/s · TTFT ${formatLatency(ttft ?? Number.NaN)}`;
 
 		// A message can end without ever streaming (empty response): the wait
@@ -498,6 +528,7 @@ export default function (pi: ExtensionAPI) {
 		store.sessions.delete(instanceId);
 		resetResponse();
 		lastFinalMainStatus = undefined;
+		lastShownSpeed = undefined;
 		// Drop the context so trailing renders can't touch a session that is gone.
 		latestCtx = undefined;
 		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
