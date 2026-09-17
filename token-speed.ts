@@ -5,31 +5,59 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 const STATUS_KEY = "token-speed";
 const LIVE_REFRESH_INTERVAL_MS = 100;
-/**
- * Since-start averages are meaningless in the first moments of a response: a
- * fat first chunk over a near-zero elapsed (floored at 1ms) computes absurd
- * tok/s values that then decay — and the aggregate sums that spike across
- * agents. Until a response has this much history, the footer shows a
- * conservative provisional rate (tokens over this floored window) instead:
- * it updates live as tokens arrive — bridging straight from the frozen TTFT
- * into the real average, with no dead time — and the floored denominator
- * bounds it so it can decay, but never spike.
- */
-const SPEED_WARMUP_MS = 1000;
 /** Safety net: drop sessions whose instance stopped reporting without a clean end (crash/kill). */
 const SESSION_TTL_MS = 5 * 60_000;
 /** Width cap for a single subagent label in the footer. */
 const MAX_LABEL_WIDTH = 16;
+/**
+ * Bucket width for the speed estimator. It shrinks with the age of the
+ * response, so a short fast response still yields buckets while a long one
+ * averages over a stable ~1s of history (SPEED_BUCKETS_KEPT x this).
+ */
+const SPEED_BUCKET_MAX_MS = 200;
+const SPEED_BUCKET_MIN_MS = 60;
+/** Bucket rates kept for the median: 5 x 200ms = a 1s window once it is long. */
+const SPEED_BUCKETS_KEPT = 5;
+/** Fewest buckets that can produce an estimate (2 intervals, i.e. 3 samples). */
+const SPEED_MIN_BUCKETS = 2;
+/**
+ * With only two buckets, a disagreement beyond this ratio means one of them
+ * carries a batched delta. Batching can only ever inflate an interval rate, so
+ * the lower of the two is the trustworthy one.
+ */
+const SPEED_GUARD_RATIO = 2.5;
+/** Sample buffer bound: the estimator only reads the tail, and a fast provider
+ *  can emit thousands of deltas in a response. */
+const SPEED_WINDOW_MAX_MS = SPEED_BUCKET_MAX_MS * (SPEED_BUCKETS_KEPT + 4);
+const SPEED_MAX_SAMPLES = 512;
+/**
+ * How long a session's last measured speed keeps counting toward the subagent
+ * aggregate after it stops streaming. Without this an agent parked in a long
+ * tool phase keeps adding its frozen rate to the sum forever, so a finished
+ * burst inflates the aggregate indefinitely.
+ */
+const AGGREGATE_SPEED_TTL_MS = 3000;
+
+/**
+ * One streaming sample: the cumulative estimated output tokens at a wall-clock
+ * instant, both relative to the start of the assistant response.
+ */
+interface SpeedSample {
+	at: number;
+	tokens: number;
+}
 
 interface SpeedState {
 	startedAt: number;
 	requestSentAt?: number;
 	firstTokenAt?: number;
+	samples: SpeedSample[];
 }
 
 interface LiveSpeed {
 	tokens: number;
-	speed: number;
+	/** Undefined until the estimator has enough history (see estimateStreamSpeed). */
+	speed?: number;
 	ttft?: number;
 }
 
@@ -46,10 +74,13 @@ interface SessionEntry {
 	label?: string;
 	running: boolean;
 	speed?: number;
-	/** Last measured (post-warmup) speed for this session — shown when it is
+	/** Last measured (post-estimator) speed for this session — shown when it is
 	 *  not currently streaming, mirroring the main session's persist-last-final
 	 *  behavior. Cleared implicitly when the entry is removed (agent end). */
 	lastSpeed?: number;
+	/** When `lastSpeed` was measured; it stops counting toward the aggregate once
+	 *  it is older than AGGREGATE_SPEED_TTL_MS. */
+	speedAt?: number;
 	updatedAt: number;
 }
 
@@ -158,6 +189,80 @@ function tokensPerSecond(tokens: number, startedAt: number): number {
 	return tokens / elapsedSeconds;
 }
 
+function median(values: number[]): number {
+	const sorted = [...values].sort((a, b) => a - b);
+	const mid = sorted.length >> 1;
+	return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+/**
+ * Streaming speed estimate: the median of the last few bucket rates.
+ *
+ * Consecutive intervals are merged into buckets of ~SPEED_BUCKET_MAX_MS, which
+ * is what makes the estimate robust to every artifact a real stream produces:
+ *
+ *  - a delta carrying no new tokens (role-only / finish_reason / usage-only
+ *    stream events) dilutes a bucket instead of becoming a 0-tok/s reading, so
+ *    the display neither flickers to 0 nor (if zeros were dropped instead)
+ *    inflates by the reciprocal of the content ratio;
+ *  - a batched delta — a fat first chunk, a whole tool-call argument blob — is
+ *    one bucket among five, and a median simply discards it;
+ *  - because the bucket width follows the response age, a response that is over
+ *    in 300ms still produces buckets, instead of showing nothing at all until a
+ *    fixed window fills up.
+ *
+ * Returns undefined until enough history exists; the caller keeps showing the
+ * previous speed until then (see speedTextFor).
+ */
+function estimateStreamSpeed(samples: SpeedSample[]): number | undefined {
+	if (samples.length < SPEED_MIN_BUCKETS + 1) return undefined;
+
+	const elapsed = samples[samples.length - 1].at;
+	const bucketMs = Math.min(
+		SPEED_BUCKET_MAX_MS,
+		Math.max(SPEED_BUCKET_MIN_MS, elapsed / 3),
+	);
+
+	const buckets: number[] = [];
+	let bucketTokens = 0;
+	let bucketSpan = 0;
+	for (let i = 1; i < samples.length; i++) {
+		const span = samples[i].at - samples[i - 1].at;
+		if (span <= 0) continue;
+		// Clamp per-interval: a shrinking partial count (a message rewritten
+		// mid-stream) must never read as a negative rate.
+		bucketTokens += Math.max(samples[i].tokens - samples[i - 1].tokens, 0);
+		bucketSpan += span;
+		if (bucketSpan >= bucketMs) {
+			buckets.push((bucketTokens / bucketSpan) * 1000);
+			bucketTokens = 0;
+			bucketSpan = 0;
+		}
+	}
+
+	const recent = buckets.slice(-SPEED_BUCKETS_KEPT);
+	if (recent.length < SPEED_MIN_BUCKETS) return undefined;
+	if (recent.length === 2) {
+		const [first, second] = recent;
+		if (first > second * SPEED_GUARD_RATIO || second > first * SPEED_GUARD_RATIO) {
+			return Math.min(first, second);
+		}
+	}
+	return median(recent);
+}
+
+/** Append a sample and bound the buffer (the estimator only reads the tail). */
+function pushSample(samples: SpeedSample[], sample: SpeedSample): void {
+	samples.push(sample);
+	const cutoff = sample.at - SPEED_WINDOW_MAX_MS;
+	while (
+		samples.length > SPEED_MAX_SAMPLES ||
+		(samples.length > SPEED_MIN_BUCKETS + 1 && samples[0].at < cutoff)
+	) {
+		samples.shift();
+	}
+}
+
 function formatSpeed(tokens: number): string {
 	if (!Number.isFinite(tokens) || tokens <= 0) {
 		return "—";
@@ -189,18 +294,24 @@ function shortLabel(label: string | undefined): string {
  * The speed part is shown only while at least one agent streams; during a global lull
  * the bare count is displayed instead of a meaningless "—".
  */
-function formatSubagents(sessions: SessionEntry[]): string {
+function formatSubagents(sessions: SessionEntry[], now: number): string {
 	if (sessions.length === 0) return "";
-	// Each agent contributes its CURRENT speed while streaming, otherwise its
-	// last measured one — so the aggregate keeps showing a speed whenever there
-	// is subagent activity (matching the main segment's persist-last-final rule)
-	// instead of dropping to a bare count at every tool/turn gap.
-	const speed = sessions.reduce(
-		(sum, entry) =>
-			sum +
-			(entry.speed !== undefined && entry.speed > 0 ? entry.speed : (entry.lastSpeed ?? 0)),
-		0,
-	);
+	// Each agent contributes its CURRENT speed while streaming. Between
+	// responses it contributes its last measured one, but only briefly: an agent
+	// parked in a long tool phase must not keep adding a frozen rate to the sum
+	// (that is what made a finished burst inflate the aggregate forever).
+	const speed = sessions.reduce((sum, entry) => {
+		if (entry.speed !== undefined && entry.speed > 0) return sum + entry.speed;
+		if (
+			entry.lastSpeed !== undefined &&
+			entry.lastSpeed > 0 &&
+			entry.speedAt !== undefined &&
+			now - entry.speedAt <= AGGREGATE_SPEED_TTL_MS
+		) {
+			return sum + entry.lastSpeed;
+		}
+		return sum;
+	}, 0);
 	const who =
 		sessions.length === 1
 			? `sub ${shortLabel(sessions[0].label) || "1"}`
@@ -229,8 +340,8 @@ export default function (pi: ExtensionAPI) {
 	let live: LiveSpeed | undefined;
 	let awaitingFirstToken = false;
 	let lastFinalMainStatus: string | undefined;
-	/** Last speed displayed in this session (live post-warmup or final). Once a
-	 *  speed has been shown, later TTFT waits and warmups keep it on screen
+	/** Last speed displayed in this session (live estimate or final). Once a
+	 *  speed has been shown, later TTFT waits and sample-starved phases keep it on screen
 	 *  instead of reverting to the "..." placeholder — only a session that has
 	 *  never shown a speed falls back to "...". */
 	let lastShownSpeed: number | undefined;
@@ -250,8 +361,8 @@ export default function (pi: ExtensionAPI) {
 	// advances the streaming throttle — flushes must not starve this session's
 	// own ~10Hz streaming cadence. throttle=true is that cadence.
 
-	/** Speed text for phases without a fresh sample (TTFT wait, warmup): once
-	 *  this session has shown a speed, keep showing it — never revert to "...". */
+	/** Speed text for phases without a fresh sample (TTFT wait, estimator warmup):
+	 *  once this session has shown a speed, keep showing it — never revert to "...". */
 	const speedTextFor = (current?: number): string => {
 		const speed = current !== undefined && current > 0 ? current : lastShownSpeed;
 		return speed !== undefined && speed > 0 ? formatSpeed(speed) : "...";
@@ -271,7 +382,7 @@ export default function (pi: ExtensionAPI) {
 				.filter(([id]) => id !== instanceId)
 				.map(([, entry]) => entry)
 				.filter((entry) => entry.running);
-			const subSegment = formatSubagents(subs);
+			const subSegment = formatSubagents(subs, now);
 
 			let status: string | undefined;
 			// The main session's own speed is always displayed once measured: live
@@ -289,8 +400,8 @@ export default function (pi: ExtensionAPI) {
 						? `⚡ ${speedTextFor()} tok/s · TTFT ${formatLatency(Math.max(now - anchor, 0))}…`
 						: `⚡ ${speedTextFor()} tok/s · TTFT ...`;
 			} else if (live) {
-				// TTFT is final the moment the first token arrives — show it even during
-				// the speed warmup, where only the speed stays hidden.
+				// TTFT is final the moment the first token arrives — show it even while
+				// the estimator still lacks history, where only the speed is withheld.
 				mainSegment = `⚡ ${speedTextFor(live.speed)} tok/s · TTFT ${formatLatency(live.ttft ?? Number.NaN)}`;
 			} else if (pendingRequestSentAt !== undefined) {
 				// Live TTFT wait (request in flight, message not started yet): the
@@ -342,17 +453,28 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	/** Report a streaming sample. `lastSpeed` is preserved across warmup zeros. */
-	const reportSpeed = (speed: number) => {
+	/** Report a streaming sample. `lastSpeed` is preserved while no estimate exists. */
+	const reportSpeed = (speed: number | undefined) => {
 		const now = performance.now();
 		const entry = store.sessions.get(instanceId);
-		const lastSpeed = speed > 0 ? speed : entry?.lastSpeed;
+		// `speed === undefined` means "not enough history yet": keep the previous
+		// sample's lastSpeed so the aggregate does not blink during the first
+		// ~200ms of a response.
+		const lastSpeed = speed !== undefined && speed > 0 ? speed : entry?.lastSpeed;
+		const speedAt = speed !== undefined && speed > 0 ? now : entry?.speedAt;
 		if (entry) {
 			entry.speed = speed;
 			entry.lastSpeed = lastSpeed;
+			entry.speedAt = speedAt;
 			entry.updatedAt = now;
 		} else {
-			store.sessions.set(instanceId, { running: false, speed, lastSpeed, updatedAt: now });
+			store.sessions.set(instanceId, {
+				running: false,
+				speed,
+				lastSpeed,
+				speedAt,
+				updatedAt: now,
+			});
 		}
 	};
 
@@ -412,8 +534,9 @@ export default function (pi: ExtensionAPI) {
 		activeResponse = {
 			startedAt: performance.now(),
 			requestSentAt: pendingRequestSentAt,
+			samples: [],
 		};
-		live = { tokens: 0, speed: 0, ttft: undefined };
+		live = { tokens: 0, speed: undefined, ttft: undefined };
 		awaitingFirstToken = true;
 		touch({ running: true, speed: 0, label: getSessionLabel(pi) });
 		// Defensive: keep the wait timer running even if before_provider_request
@@ -434,7 +557,7 @@ export default function (pi: ExtensionAPI) {
 		if (activeResponse.firstTokenAt === undefined) {
 			activeResponse.firstTokenAt = now;
 			// First token received: the wait is over. Stop the live TTFT timer and
-			// decouple "waiting" from the speed warmup so the final TTFT shows now.
+			// decouple "waiting" from the speed estimate so the final TTFT shows now.
 			stopWaitTicker();
 			awaitingFirstToken = false;
 		}
@@ -443,25 +566,17 @@ export default function (pi: ExtensionAPI) {
 				? activeResponse.firstTokenAt - activeResponse.requestSentAt
 				: undefined;
 
-		// Always keep the local snapshot fresh — even when throttled — so any
-		// forced render (e.g. a flush caused by another session) shows the
-		// CURRENT main-segment values instead of a stale placeholder.
+		// The full assistant message is always provided, even on the very first
+		// update — so this sample carries the whole (possibly batched) first chunk,
+		// and the naive "tokens since start" is what used to spike here.
 		const outputTokens = getOutputTokens(message);
-		const elapsed = now - activeResponse.startedAt;
-		// The since-start average is not yet meaningful in the first moments (fat
-		// first chunk over near-zero elapsed), but the display must not sit on the
-		// previous response's stale value until warmup ends either. During the
-		// warmup window, show a conservative provisional rate: tokens over a
-		// floored 1s denominator — live-updating so the speed bridges straight
-		// from the frozen TTFT into the real average with no dead time, and
-		// bounded so it can decay but never spike. Continuous by construction:
-		// at the warmup boundary both branches compute tokens / 1s.
-		const speed =
-			elapsed < SPEED_WARMUP_MS
-				? outputTokens / (SPEED_WARMUP_MS / 1000)
-				: tokensPerSecond(outputTokens, activeResponse.startedAt);
+		pushSample(
+			activeResponse.samples,
+			{ at: now - activeResponse.startedAt, tokens: outputTokens },
+		);
+		const speed = estimateStreamSpeed(activeResponse.samples);
 		live = { tokens: outputTokens, speed, ttft };
-		if (speed > 0) lastShownSpeed = speed;
+		if (speed !== undefined && speed > 0) lastShownSpeed = speed;
 
 		// Report and render at most ~10Hz. This gate MUST live outside the render:
 		// UI-less subagent instances would otherwise report every single delta.
@@ -486,7 +601,21 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const outputTokens = getOutputTokens(message);
-		const speed = tokensPerSecond(outputTokens, activeResponse.startedAt);
+		pushSample(
+			activeResponse.samples,
+			{ at: performance.now() - activeResponse.startedAt, tokens: outputTokens },
+		);
+		// Final speed: the same estimator the streaming display used, so the number
+		// the user was reading does not jump at the end. `usage.output / elapsed` is
+		// only a fallback for a response that was too short to measure (one delta,
+		// so there is no rate to observe) — it is a throughput that includes the
+		// prefill, which is why a 100-token answer that completes in 200ms would
+		// otherwise be reported as hundreds of tok/s and stay on screen.
+		const estimated = estimateStreamSpeed(activeResponse.samples);
+		const speed =
+			estimated !== undefined && estimated > 0
+				? estimated
+				: tokensPerSecond(outputTokens, activeResponse.startedAt);
 		const ttft =
 			activeResponse.requestSentAt !== undefined && activeResponse.firstTokenAt !== undefined
 				? activeResponse.firstTokenAt - activeResponse.requestSentAt
@@ -504,6 +633,7 @@ export default function (pi: ExtensionAPI) {
 		lastLiveRenderAt = -Infinity;
 		lastReportAt = -Infinity;
 		// Still running (more turns may follow) — just no longer streaming.
+		// Clearing the current speed also stamps the aggregate expiry clock.
 		touch({ speed: undefined });
 		render(true);
 		// The aggregate changed for the footer owner (if this isn't it).

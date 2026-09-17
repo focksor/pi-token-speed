@@ -3,9 +3,9 @@
  * driven with realistic streaming (TTFT wait, ~100ms chunks, occasional
  * bursts) through the REAL extension code.
  *
- * Watch for the bridging behavior:
- *   response 1 final speed → wait phase keeps it (TTFT ticking)
- *   → TTFT freezes → provisional speed ramps live → real average takes over
+ * Watch for:
+ *   response 1: TTFT wait timer → TTFT freezes → bucketed-median speed settles
+ *   response 2: the previous response's speed is kept through the wait
  *
  * Run: node demo-timeline.ts
  */
@@ -74,7 +74,7 @@ await sleep(1500);
 await stream(inst, {
 	ttft: 900,
 	ms: 2200,
-	label: "Response 2 (bridge: keep speed → TTFT freeze → provisional ramp → real average)",
+	label: "Response 2 (previous speed is kept through the wait)",
 });
 
 await sleep(300);
