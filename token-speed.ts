@@ -10,25 +10,28 @@ const SESSION_TTL_MS = 5 * 60_000;
 /** Width cap for a single subagent label in the footer. */
 const MAX_LABEL_WIDTH = 16;
 /**
- * Bucket width for the speed estimator. It shrinks with the age of the
- * response, so a short fast response still yields buckets while a long one
- * averages over a stable ~1s of history (SPEED_BUCKETS_KEPT x this).
+ * Speed estimator window: how many recent CYCLES back the live estimate looks.
+ * A cycle is measured between two token-carrying arrivals, so a fat delta can
+ * only ever pollute its own cycle instead of a wall-clock bucket that mixes a
+ * stall with several bursts.
  */
-const SPEED_BUCKET_MAX_MS = 200;
-const SPEED_BUCKET_MIN_MS = 60;
-/** Bucket rates kept for the median: 5 x 200ms = a 1s window once it is long. */
-const SPEED_BUCKETS_KEPT = 5;
-/** Fewest buckets that can produce an estimate (2 intervals, i.e. 3 samples). */
-const SPEED_MIN_BUCKETS = 2;
+const SPEED_WINDOW = 8;
 /**
- * With only two buckets, a disagreement beyond this ratio means one of them
- * carries a batched delta. Batching can only ever inflate an interval rate, so
- * the lower of the two is the trustworthy one.
+ * Below this many cycles the window takes the MINIMUM instead of the median.
+ * A median only discards outliers while they stay a minority; with a 3-cycle
+ * window two polluted cycles already carry it (measured: 2600 tok/s against a
+ * true 100). The minimum is the only honest reading when data is scarce.
  */
-const SPEED_GUARD_RATIO = 2.5;
-/** Sample buffer bound: the estimator only reads the tail, and a fast provider
- *  can emit thousands of deltas in a response. */
-const SPEED_WINDOW_MAX_MS = SPEED_BUCKET_MAX_MS * (SPEED_BUCKETS_KEPT + 4);
+const SPEED_SMALL_WINDOW = 5;
+/** Fewest cycles that can produce a rate at all (2 intervals = 3 arrivals). */
+const SPEED_MIN_CYCLES = 2;
+/**
+ * Sample buffer bound. Indices only — there is deliberately NO time-based
+ * cutoff: a provider that emits a delta every 300ms+ would leave fewer than
+ * SPEED_WINDOW+1 arrivals in any short time window, so the cycle window could
+ * never fill and the footer would show no speed at all (measured: 3 arrivals
+ * retained under the former 1800ms cutoff).
+ */
 const SPEED_MAX_SAMPLES = 512;
 /**
  * How long a session's last measured speed keeps counting toward the subagent
@@ -196,69 +199,55 @@ function median(values: number[]): number {
 }
 
 /**
- * Streaming speed estimate: the median of the last few bucket rates.
+ * Per-cycle rates: the rate of each interval between two token-carrying
+ * arrivals, most recent `keep` cycles first-to-last.
  *
- * Consecutive intervals are merged into buckets of ~SPEED_BUCKET_MAX_MS, which
- * is what makes the estimate robust to every artifact a real stream produces:
- *
- *  - a delta carrying no new tokens (role-only / finish_reason / usage-only
- *    stream events) dilutes a bucket instead of becoming a 0-tok/s reading, so
- *    the display neither flickers to 0 nor (if zeros were dropped instead)
- *    inflates by the reciprocal of the content ratio;
- *  - a batched delta — a fat first chunk, a whole tool-call argument blob — is
- *    one bucket among five, and a median simply discards it;
- *  - because the bucket width follows the response age, a response that is over
- *    in 300ms still produces buckets, instead of showing nothing at all until a
- *    fixed window fills up.
- *
- * Returns undefined until enough history exists; the caller keeps showing the
- * previous speed until then (see speedTextFor).
+ * A zero-token arrival cannot open a cycle, so role-only, finish_reason,
+ * usage-only and heartbeat events cannot pollute the estimate at all — the
+ * former bucketing had to absorb them, which either flickered to 0 or (if
+ * dropped) inflated by the reciprocal of the content ratio.
  */
-function estimateStreamSpeed(samples: SpeedSample[]): number | undefined {
-	if (samples.length < SPEED_MIN_BUCKETS + 1) return undefined;
+function cycleRates(samples: SpeedSample[], keep: number): number[] {
+	// Indices of arrivals that carry tokens (the first sample counts only if
+	// it already does — the initial message_start sample never does).
+	const content: number[] = [];
+	for (let i = 0; i < samples.length; i++) {
+		const grew =
+			i === 0 ? samples[i].tokens > 0 : samples[i].tokens > samples[i - 1].tokens;
+		if (grew) content.push(i);
+	}
 
-	const elapsed = samples[samples.length - 1].at;
-	const bucketMs = Math.min(
-		SPEED_BUCKET_MAX_MS,
-		Math.max(SPEED_BUCKET_MIN_MS, elapsed / 3),
-	);
-
-	const buckets: number[] = [];
-	let bucketTokens = 0;
-	let bucketSpan = 0;
-	for (let i = 1; i < samples.length; i++) {
-		const span = samples[i].at - samples[i - 1].at;
+	const rates: number[] = [];
+	const from = Math.max(1, content.length - keep);
+	for (let k = from; k < content.length; k++) {
+		const prev = samples[content[k - 1]];
+		const cur = samples[content[k]];
+		const span = cur.at - prev.at;
 		if (span <= 0) continue;
-		// Clamp per-interval: a shrinking partial count (a message rewritten
-		// mid-stream) must never read as a negative rate.
-		bucketTokens += Math.max(samples[i].tokens - samples[i - 1].tokens, 0);
-		bucketSpan += span;
-		if (bucketSpan >= bucketMs) {
-			buckets.push((bucketTokens / bucketSpan) * 1000);
-			bucketTokens = 0;
-			bucketSpan = 0;
-		}
+		// Clamp: a message rewritten mid-stream can lower the partial count.
+		rates.push((Math.max(cur.tokens - prev.tokens, 0) / span) * 1000);
 	}
-
-	const recent = buckets.slice(-SPEED_BUCKETS_KEPT);
-	if (recent.length < SPEED_MIN_BUCKETS) return undefined;
-	if (recent.length === 2) {
-		const [first, second] = recent;
-		if (first > second * SPEED_GUARD_RATIO || second > first * SPEED_GUARD_RATIO) {
-			return Math.min(first, second);
-		}
-	}
-	return median(recent);
+	return rates;
 }
 
-/** Append a sample and bound the buffer (the estimator only reads the tail). */
+/**
+ * Streaming speed estimate: the median of the recent cycle rates, with a
+ * minimum while the window is still small.
+ *
+ * Returns undefined until SPEED_MIN_CYCLES cycles exist; the caller keeps
+ * showing the previous speed until then (see speedTextFor).
+ */
+function estimateStreamSpeed(samples: SpeedSample[]): number | undefined {
+	const rates = cycleRates(samples, SPEED_WINDOW);
+	if (rates.length < SPEED_MIN_CYCLES) return undefined;
+	if (rates.length < SPEED_SMALL_WINDOW) return Math.min(...rates);
+	return median(rates);
+}
+
+/** Append a sample and bound the buffer by COUNT only (see SPEED_MAX_SAMPLES). */
 function pushSample(samples: SpeedSample[], sample: SpeedSample): void {
 	samples.push(sample);
-	const cutoff = sample.at - SPEED_WINDOW_MAX_MS;
-	while (
-		samples.length > SPEED_MAX_SAMPLES ||
-		(samples.length > SPEED_MIN_BUCKETS + 1 && samples[0].at < cutoff)
-	) {
+	while (samples.length > SPEED_MAX_SAMPLES) {
 		samples.shift();
 	}
 }
