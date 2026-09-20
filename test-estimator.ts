@@ -177,6 +177,27 @@ const clean = (n: number) => Array.from({ length: n }, (_, i) => [50, (i + 1) * 
 	expect(peak(shown)! > 4000, `cold start does not clamp the formula value (${peak(shown)})`);
 }
 
+// 粗粒度 provider：delta 间隔 >= 300ms 时，既有实现的时间裁剪只留 3 个到达，
+// 周期窗口永远凑不齐 -> footer 不显示任何速度。新规则必须能算出来。
+for (const [gapMs, chunk] of [
+	[300, 30],
+	[1000, 100],
+	[2000, 200],
+] as Array<[number, number]>) {
+	const steps: Array<[number, number]> = [];
+	let acc = 0;
+	for (let i = 0; i < 6; i++) steps.push([gapMs, (acc += chunk)]);
+	const shown = await stream(
+		createInstance(true, { provider: "coarse", id: `gap-${gapMs}` }),
+		steps,
+	);
+	const expected = (chunk / gapMs) * 1000;
+	expect(
+		final(shown) !== undefined && Math.abs(final(shown)! - expected) / expected < 0.2,
+		`coarse ${gapMs}ms provider is measurable (final ${final(shown)}, expected ~${expected})`,
+	);
+}
+
 performance.now = realNow;
 if (failures > 0) {
 	console.error(`\n${failures} check(s) failed.`);
