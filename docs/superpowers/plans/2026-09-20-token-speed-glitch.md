@@ -33,7 +33,7 @@
   - `pushSample(samples: SpeedSample[], sample: SpeedSample): void` — 签名不变，裁剪策略改为仅按数量。
   - `estimateStreamSpeed(samples: SpeedSample[]): number | undefined` — 签名不变，实现替换。
   - 新常量：`SPEED_WINDOW = 8`、`SPEED_SMALL_WINDOW = 5`、`SPEED_MIN_CYCLES = 2`。
-  - 新内部函数：`cycleRates(samples: SpeedSample[], keep: number): number[]`（返回尾部至多 `keep` 个周期速率，供 Task 3 复用于历史采样）。
+  - 新内部函数：`cycleRates(samples: SpeedSample[], keep: number): number[]`（返回尾部至多 `keep` 个周期速率，供 Task 2 复用于历史采样）。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -276,22 +276,26 @@ a delta every 300ms+, so the cycle window could never fill."
 
 ---
 
-### Task 2: 每个 (provider, model) 的内存历史环
+### Task 2: 历史环 + 闸门接入 + 超短回复夹紧
 
 **Files:**
-- Modify: `token-speed.ts`（新增常量、`SpeedHistory` 接口、`SharedStore` 字段、`getStore()` 迁移、新函数 `rateKey`/`recordResponseHistory`/`plausibilityBound`）
-- Test: `test-estimator.ts`（追加断言）
+- Modify: `token-speed.ts`（常量与类型、`SharedStore` 迁移、历史函数、`estimateStreamSpeed` 加闸门参数、两个调用点、`message_end` 写入历史、超短回复夹紧）
+- Test: `test-estimator.ts`
 
 **Interfaces:**
-- Consumes: Task 1 的 `cycleRates(samples, keep)`、`median(values)`。
+- Consumes: Task 1 的 `cycleRates(samples, keep)`、`median(values)`、`estimateStreamSpeed(samples)`。
 - Produces:
-  - `interface SpeedHistory { samples: number[]; next: number }` — 环形缓冲。
+  - `interface SpeedHistory { samples: number[]; next: number }`
   - `interface Gate { median: number; bound: number }`
   - `rateKey(ctx: ExtensionContext | undefined): string | undefined`
   - `recordResponseHistory(store: SharedStore, key: string, samples: SpeedSample[]): void`
   - `plausibilityBound(store: SharedStore, key: string | undefined): Gate | undefined`
   - `SharedStore.history: Map<string, SpeedHistory>`
-  - 新常量：`HISTORY_CAP = 32`、`HISTORY_MIN_SAMPLES = 12`、`HISTORY_SEGMENTS = 4`、`GATE_K = 6`、`MAD_TO_SIGMA = 1.4826`、`GATE_SPREAD_FLOOR = 0.3`。
+  - `estimateStreamSpeed(samples: SpeedSample[], gate?: Gate): number | undefined` — **新增可选第二参数**
+  - 超短回复路径：`final = gate ? Math.min(formula, gate.bound) : formula`
+  - 新常量：`HISTORY_CAP = 32`、`HISTORY_MIN_SAMPLES = 12`、`HISTORY_SEGMENTS = 4`、`HISTORY_MIN_CYCLES`、`GATE_K = 6`、`MAD_TO_SIGMA = 1.4826`、`GATE_SPREAD_FLOOR = 0.3`
+
+> **合并说明：** 本任务合并了原计划的 Task 2（历史存储）与 Task 3（闸门接入）。二者是同一功能的存储侧与消费侧；原拆分会让 Task 2 结束时有一项断言必然失败（闸门未接入），与 Global Constraints 的"每个任务结束必须全绿"冲突。Steps 1–6 为历史存储，Steps 7–9 为闸门接入与夹紧，Step 10 统一验证与提交。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -481,7 +485,7 @@ function plausibilityBound(store: SharedStore, key: string | undefined): Gate | 
 
 - [ ] **Step 6: 在 message_end 写入历史**
 
-这里只需让训练路径生效，闸门接入在 Task 3。在 `pi.on("message_end", ...)` 内、`stopWaitTicker();` 之前插入（**必须在 `activeResponse = undefined` 之前**）：
+在 `pi.on("message_end", ...)` 内、`stopWaitTicker();` 之前插入（**必须在 `activeResponse = undefined` 之前**）：
 
 ```ts
 		// Feed the plausibility history before the response state is dropped.
@@ -491,89 +495,9 @@ function plausibilityBound(store: SharedStore, key: string | undefined): Gate | 
 		}
 ```
 
-- [ ] **Step 7: 运行测试确认通过**
+- [ ] **Step 7: 给估计器加闸门参数**
 
-Run: `node test-estimator.ts`
-Expected: 前 4 项 PASS；`trained gate suppresses adjacent fat chunks` 仍 FAIL（闸门未接入，Task 3 完成）。
-
-- [ ] **Step 8: 提交（允许最后一项测试仍失败，Task 3 收口）**
-
-```bash
-git add token-speed.ts test-estimator.ts
-git commit -m "feat: record per-(provider,model) speed history in the shared store
-
-Adds the in-memory history ring the plausibility gate will read: each
-response contributes HISTORY_SEGMENTS segment medians, so one spike cannot
-move the history while the ring still fills within a few responses. The
-store stays on globalThis with the same field-wise migration the rest of
-the store uses, and there is no disk IO."
-```
-
----
-
-### Task 3: 接入闸门与超短回复夹紧
-
-**Files:**
-- Modify: `token-speed.ts`（`estimateStreamSpeed` 加闸门参数、两个调用点、超短回复夹紧）
-- Test: `test-estimator.ts`
-
-**Interfaces:**
-- Consumes: Task 2 的 `plausibilityBound(store, key)`、`rateKey(ctx)`、`recordResponseHistory`。
-- Produces:
-  - `estimateStreamSpeed(samples: SpeedSample[], gate?: Gate): number | undefined` — **新增可选第二参数**。
-  - 超短回复路径：`final = gate ? Math.min(formula, gate.bound) : formula`。
-
-- [ ] **Step 1: 写失败测试**
-
-在 `test-estimator.ts` 追加（闸门已由 Task 2 训练，此处验证行为）：
-
-```ts
-// 诚实抖动不得被低估：两态 50/200（真实 125）显示须落在 [100,150]
-{
-	// 交替的周期速率为 50 与 200 tok/s、每段 1s：真实吞吐是 125 tok/s。
-	// 因此 token 累计量须按每 1000ms 间隔增长 50/200。
-	const steps: Array<[number, number]> = [];
-	let acc = 0;
-	for (let i = 0; i < 12; i++) {
-		acc += i % 2 ? 200 : 50;
-		steps.push([1000, acc]);
-	}
-	const shown = await stream(createInstance(true, { provider: "gate", id: "jitter" }), steps);
-	expect(
-		final(shown)! >= 100 && final(shown)! <= 150,
-		`honest jitter (rates 50/200, true 125) reads ~125, not 50 (final ${final(shown)})`,
-	);
-}
-
-// 超短回复夹紧：1 delta / 50 tok / 250ms 的公式值 192，训练过的键上界 ~280，
-// 故 192 原样显示；而一个 5x 上界的公式值必须被夹到上界。
-{
-	const key = { provider: "clamp", id: "model" };
-	for (let i = 0; i < 6; i++) await stream(createInstance(true, key), clean(24));
-	// 192 tok/s <= bound：原样
-	const small = await stream(createInstance(true, key), [[250, 50]]);
-	expect(Math.abs(final(small)! - 192) < 2, `short reply within the bound is unchanged (${final(small)})`);
-	// 1000 tok / 200ms = 5000 tok/s >> bound：夹到上界
-	await stream(createInstance(true, key), [[200, 1000]]);
-	const big = await stream(createInstance(true, key), [[200, 1000]]);
-	expect(peak(big)! < 600, `an absurd short-reply formula value is clamped to the bound (${peak(big)})`);
-}
-
-// 冷启动：无闸门时不夹紧，公式值原样（与既有行为一致）
-{
-	const shown = await stream(createInstance(true, { provider: "clamp", id: "cold" }), [[200, 1000]]);
-	expect(peak(shown)! > 4000, `cold start does not clamp the formula value (${peak(shown)})`);
-}
-```
-
-- [ ] **Step 2: 运行测试确认失败**
-
-Run: `node test-estimator.ts`
-Expected: FAIL — `an absurd short-reply formula value is clamped`（尚未夹紧，显示 ~5000）。
-
-- [ ] **Step 3: 给估计器加闸门参数**
-
-把 Task 1 的 `estimateStreamSpeed` 替换为：
+把 Task 1 的 `estimateStreamSpeed` 替换为（新增可选 `gate` 参数，并给出完整函数体）：
 
 ```ts
 /**
@@ -594,7 +518,7 @@ function estimateStreamSpeed(samples: SpeedSample[], gate?: Gate): number | unde
 }
 ```
 
-- [ ] **Step 4: 在两个调用点传入闸门**
+- [ ] **Step 8: 在两个调用点传入闸门**
 
 `message_update` 中把 `const speed = estimateStreamSpeed(activeResponse.samples);` 替换为：
 
@@ -605,16 +529,11 @@ function estimateStreamSpeed(samples: SpeedSample[], gate?: Gate): number | unde
 		);
 ```
 
-`message_end` 中把 `const estimated = estimateStreamSpeed(activeResponse.samples);` 替换为：
+`message_end` 中把 `const estimated = estimateStreamSpeed(activeResponse.samples);` 及其后的回退表达式替换为：
 
 ```ts
 		const gate = plausibilityBound(store, rateKey(ctx));
 		const estimated = estimateStreamSpeed(activeResponse.samples, gate);
-```
-
-同一处理器内，把超短回复回退改为夹紧（把 `: tokensPerSecond(outputTokens, activeResponse.startedAt);` 那一段替换为）：
-
-```ts
 		// A response too short to measure has no observable cycle; fall back to
 		// usage.output / elapsed — which includes the prefill, so it is a
 		// throughput, not a rate. Clamp it to the model's plausible range so a
@@ -629,39 +548,78 @@ function estimateStreamSpeed(samples: SpeedSample[], gate?: Gate): number | unde
 					: formula;
 ```
 
-- [ ] **Step 5: 运行测试确认通过**
+- [ ] **Step 9: 追加闸门行为测试**
 
-Run: `node test-estimator.ts`
-Expected: PASS — 全部检查绿。
+在 `test-estimator.ts` 的 `performance.now = realNow;` 之前追加（闸门已在 Step 6 训练路径下生效，此处验证行为）：
 
-- [ ] **Step 6: 跑全部验证**
+```ts
+// 诚实抖动不得被低估：周期速率交替 50/200（真实 125）显示须落在 [100,150]
+{
+	// 交替的周期速率为 50 与 200 tok/s、每段 1s：真实吞吐是 125 tok/s。
+	// 因此 token 累计量须按每 1000ms 间隔增长 50/200。
+	const steps: Array<[number, number]> = [];
+	let acc = 0;
+	for (let i = 0; i < 12; i++) {
+		acc += i % 2 ? 200 : 50;
+		steps.push([1000, acc]);
+	}
+	const shown = await stream(createInstance(true, { provider: "gate", id: "jitter" }), steps);
+	expect(
+		final(shown)! >= 100 && final(shown)! <= 150,
+		`honest jitter (rates 50/200, true 125) reads ~125, not 50 (final ${final(shown)})`,
+	);
+}
+
+// 超短回复夹紧：1 delta / 50 tok / 250ms 的公式值 192，训练过的键上界 ~280，
+// 故 192 原样显示；而一个远超上界的公式值必须被夹到上界。
+{
+	const key = { provider: "clamp", id: "model" };
+	for (let i = 0; i < 6; i++) await stream(createInstance(true, key), clean(24));
+	const small = await stream(createInstance(true, key), [[250, 50]]);
+	expect(Math.abs(final(small)! - 192) < 2, `short reply within the bound is unchanged (${final(small)})`);
+	await stream(createInstance(true, key), [[200, 1000]]);
+	const big = await stream(createInstance(true, key), [[200, 1000]]);
+	expect(peak(big)! < 600, `an absurd short-reply formula value is clamped to the bound (${peak(big)})`);
+}
+
+// 冷启动：无闸门时不夹紧，公式值原样（与既有行为一致）
+{
+	const shown = await stream(createInstance(true, { provider: "clamp", id: "cold" }), [[200, 1000]]);
+	expect(peak(shown)! > 4000, `cold start does not clamp the formula value (${peak(shown)})`);
+}
+```
+
+- [ ] **Step 10: 跑全部验证并提交**
 
 Run:
 ```bash
 node test-estimator.ts && node test-global.ts && node token-speed.ts && \
 npx tsc --module nodenext --moduleResolution nodenext --target es2022 --strict --noEmit --skipLibCheck --types node token-speed.ts
 ```
-Expected: 全部通过，tsc 退出码 0。
-
-- [ ] **Step 7: 提交**
+Expected: `All checks passed.` + `All checks passed.` + 冒烟无输出 + tsc 退出码 0。
 
 ```bash
 git add token-speed.ts test-estimator.ts
-git commit -m "fix: gate live speed on the model's own history, clamp short replies
+git commit -m "feat: gate live speed on the model's own history, clamp short replies
 
-Connects the plausibility bound to the estimator: cycles above the model's
-observed range are dropped, and the footer stays silent (keeping the last
-shown speed) when nothing plausible remains. Cold start is deliberately
-unfiltered — an unknown model is never censored.
+Adds an in-memory per-(provider, model) history ring that each response
+feeds with HISTORY_SEGMENTS segment medians, so a single spike cannot move
+the history while the ring still fills within a few responses. The derived
+plausibility bound (median + 6 x max(1.4826 MAD, 0.3 median)) drops cycle
+rates that are more likely arrival artifacts than real rates; when nothing
+plausible remains the footer stays silent and keeps the last shown speed.
 
-A response too short to measure still uses usage.output / elapsed, but is
-now clamped to the plausible range, so an absurd formula value (which
-includes prefill) can no longer freeze on the footer."
+Cold start is deliberately unfiltered: an unknown model is never censored
+on the basis of not having been seen before. A response too short to
+measure still uses usage.output / elapsed, now clamped to the plausible
+range so an absurd formula value (which includes prefill) cannot freeze on
+the footer. The store stays on globalThis with the same field-wise
+migration the rest of it uses, and there is no disk IO."
 ```
 
 ---
 
-### Task 4: 粗粒度 provider 可测性（验证时间裁剪确已移除）
+### Task 3: 粗粒度 provider 可测性（验证时间裁剪确已移除）
 
 **Files:**
 - Test: `test-estimator.ts`
@@ -714,7 +672,7 @@ emitting a delta every 300ms-2s must still produce a speed reading."
 
 ---
 
-### Task 5: 文档与版本
+### Task 4: 文档与版本
 
 **Files:**
 - Modify: `README.md`（"速度估计算法"章节、新增可行域闸门与代价说明、开发命令加测试）
@@ -811,29 +769,29 @@ estimator regression to the dev commands and CI."
 | Spec 章节 | 实施任务 |
 |---|---|
 | §1 周期定义（替代墙钟桶） | Task 1 |
-| §1 删除时间裁剪 | Task 1 Step 4 + Task 4（回归保护） |
+| §1 删除时间裁剪 | Task 1 Step 4 + Task 3（回归保护） |
 | §2 实时取值（min / median） | Task 1 Step 4 |
-| §2 冷启动残留缺口（记录、不修） | Task 5 Step 1（写入 README 代价） |
-| §3 可行域闸门（键、样本写入、容量、公式、未启用条件、拒绝静默） | Task 2 + Task 3 |
+| §2 冷启动残留缺口（记录、不修） | Task 4 Step 1（写入 README 代价） |
+| §3 可行域闸门（键、样本写入、容量、公式、未启用条件、拒绝静默） | Task 2 |
 | §3 用 MAD 不用标准差 | Task 2 Step 5 |
 | §3 每响应写入用全部周期速率（非闸门子集） | Task 2 Step 5 |
-| §4 超短回复夹紧到上界 | Task 3 Step 4 |
-| §5 与既有逻辑的关系（不回退、TTFT、聚合、迁移） | 无改动；Task 1/3 的每步验证要求既有回归全绿 |
-| 决策：仅内存、静默、夹紧、历史导出 | Task 2（仅内存）、Task 3（静默 + 夹紧）|
+| §4 超短回复夹紧到上界 | Task 2 Step 8 |
+| §5 与既有逻辑的关系（不回退、TTFT、聚合、迁移） | 无改动；Task 1/2 的每步验证要求既有回归全绿 |
+| 决策：仅内存、静默、夹紧、历史导出 | Task 2 |
 | 测试计划 1/2/3/4（相邻肥 chunk、blob、flush、静默后 flush） | Task 1 Step 1（早期相邻肥 chunk）、Task 2 Step 1（训练后相邻肥 chunk）|
 | 测试计划 5（不误伤真高速） | Task 2 Step 1（冷启动 2000）|
-| 测试计划 6（诚实抖动不低估） | Task 3 Step 1 |
+| 测试计划 6（诚实抖动不低估） | Task 2 Step 9 |
 | 测试计划 7/8（冷启动不误伤 / 相对既有实现改进） | Task 1 Step 1、Task 2 Step 1 |
-| 测试计划 9（超短回复夹紧） | Task 3 Step 1 |
-| 测试计划 10（粗粒度可测） | Task 4 |
+| 测试计划 9（超短回复夹紧） | Task 2 Step 9 |
+| 测试计划 10（粗粒度可测） | Task 3 |
 | 测试计划 11（无磁盘写入） | 由 Global Constraints 的"不得引入任何磁盘 IO"约束保证；实现中无 fs import，故无文件可写 |
-| 代价写入 README | Task 5 Step 1 |
+| 代价写入 README | Task 4 Step 1 |
 
-**2. Placeholder scan:** 无 TBD/TODO；每个代码步骤都给出了完整代码；无"类似 Task N"式引用（Task 4 的测试代码完整重复给出）。
+**2. Placeholder scan:** 无 TBD/TODO；每个代码步骤都给出了完整代码；无"类似 Task N"式引用（Task 3 的测试代码完整重复给出）。
 
-**3. Type consistency:** `cycleRates(samples, keep)`（Task 1 定义 → Task 2 复用）、`estimateStreamSpeed(samples, gate?)`（Task 1 定义两参数前的签名、Task 3 加第二参数，调用点同步更新）、`plausibilityBound(store, key)`（Task 2 定义 → Task 3 调用）、`rateKey(ctx)`（Task 2 定义 → Task 3 调用）、`recordResponseHistory(store, key, samples)`（Task 2 定义 → Task 2 Step 6 调用）均已核对一致。`Gate` / `SpeedHistory` 在 Task 2 定义、Task 3 使用，字段名 `median` / `bound` / `samples` / `next` 一致。
+**3. Type consistency:** `cycleRates(samples, keep)`（Task 1 定义 → Task 2 复用）、`estimateStreamSpeed(samples, gate?)`（Task 1 定义单参数版本、Task 2 Step 7 加第二参数并同步两个调用点）、`plausibilityBound(store, key)` 与 `rateKey(ctx)`（Task 2 Step 5 定义 → Task 2 Step 8 调用）、`recordResponseHistory(store, key, samples)`（Task 2 定义 → Task 2 Step 6 调用）均已核对一致。`Gate` / `SpeedHistory` 均在 Task 2 定义与使用，字段名 `median` / `bound` / `samples` / `next` 一致。
 
-**已知的 Task 2 中间状态：** Task 2 Step 7 结束时 `trained gate suppresses adjacent fat chunks` 仍会失败——闸门在 Task 3 才接入估计器。这是刻意的任务切分（历史存储 vs. 闸门生效），Task 2 的提交信息也已说明。若执行者希望每个任务结束时测试全绿，可把 Task 2 与 Task 3 合并为一个任务。
+**任务切分说明：** 原计划的 Task 2（历史存储）与 Task 3（闸门接入）已合并为单个 Task 2，因此每个任务结束时全部检查均为绿色，`test-estimator.ts` 中不存在任何"已知失败"的中间状态。
 
 **计划代码已验证：** 本计划中 Task 1–4 的实现代码与全部测试代码，已在一份临时副本上完整应用并跑通（13 项检查全绿、`test-global.ts` 33 项全绿、`node token-speed.ts` 冒烟通过、`tsc --strict` 无输出），随后已回退到原始 `token-speed.ts`，仓库保持干净。验证过程中修正了测试⾃身的三个缺陷，均已写回本计划的代码：
 
