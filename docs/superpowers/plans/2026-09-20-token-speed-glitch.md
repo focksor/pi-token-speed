@@ -186,10 +186,11 @@ const SPEED_SMALL_WINDOW = 5;
 const SPEED_MIN_CYCLES = 2;
 /**
  * Sample buffer bound. Indices only — there is deliberately NO time-based
- * cutoff: a provider that emits a delta every 300ms+ would leave fewer than
- * SPEED_WINDOW+1 arrivals in any short time window, so the cycle window could
- * never fill and the footer would show no speed at all (measured: 3 arrivals
- * retained under the former 1800ms cutoff).
+ * cutoff. The former 1800ms cutoff left only 3 arrivals for a provider
+ * emitting a delta every 700ms+, i.e. exactly SPEED_MIN_CYCLES, so the
+ * estimator degraded to the min rule and a single stretched cycle dominated
+ * the reading (measured: one 50 tok/s cycle read as 50 instead of 100).
+ * Count-only clipping keeps the full SPEED_WINDOW for any arrival spacing.
  */
 const SPEED_MAX_SAMPLES = 512;
 ```
@@ -278,8 +279,10 @@ delta to its own cycle, and zero-token events cannot open a cycle at all.
 
 The window takes the minimum below SPEED_SMALL_WINDOW cycles, because a
 median is only outlier-proof while outliers stay a minority. Drops the
-time-based sample cutoff: it left only 3 arrivals for a provider emitting
-a delta every 300ms+, so the cycle window could never fill."
+time-based sample cutoff: it left only 3 arrivals — exactly
+SPEED_MIN_CYCLES — for a provider emitting a delta every 300ms+,
+degrading the estimator to the min rule so one stretched cycle dominated
+the reading."
 ```
 
 ---
@@ -745,7 +748,8 @@ coverage that coarse providers still produce a reading."
 代价（实测）：
 
 - 如果模型的真实速率超过历史中位数约 2.8 倍（例如换到快得多的模型），会有最多约 **5 个响应**的"暂无新数字"期（继续显示上一次的速度），之后恢复正常。
-- 持续粗粒度交付（例如代理批量转发）在积累足够历史后会被闸门识别并静默——这是"不再显示高于常理的读数"的必然代价，单靠时间规则无法区分"模型快"与"传输批量化"。
+- 持续粗粒度交付（例如代理批量转发）**不会**被永久静默：闸门无法区分"模型快"与"传输批量化"，因此**均匀**的批量交付会被历史吸收（显示该速率）；只有**高于**该模型历史分布的交付会先静默、并在约 5 个响应后随历史适应而恢复显示。这是"不再显示高于常理的读数"的代价，单靠时间规则无法还原真实速率。
+- 一个响应只有包含至少 8 个周期（9 个带 token 到达）才会写入历史；更短的响应只是不参与历史积累。
 - 无历史时若窗口内污染占多数（8 个周期中 ≥4 个），中位数仍可能被带跑；这与旧实现是同一个极限，闸门在约 3 个响应后关闭该缺口。
 - 整个响应只有一个 delta（例如 200ms 内结束的短回复）时，沿用 `usage.output / 耗时` 作为最终值，但已**夹紧到该模型的历史可行域**；无历史时不夹紧。
 
@@ -757,7 +761,7 @@ coverage that coarse providers still produce a reading."
 在"## 开发"的代码块中，`node test-global.ts` 之前插入一行：
 
 ```bash
-node test-estimator.ts  # 估计器回归：周期采样、可行域闸门、超短回复夹紧
+node test-estimator.ts    # 估计器回归：周期采样、可行域闸门、超短回复夹紧
 ```
 
 - [ ] **Step 3: 更新 CI**

@@ -113,7 +113,9 @@ const clean = (n: number) => Array.from({ length: n }, (_, i) => [50, (i + 1) * 
 // 20 倍 spike 响应不得把显示推到 5100。
 {
 	const key = { provider: "gate", id: "model-train" };
-	for (let i = 0; i < 6; i++) {
+	// 10 个健康响应写入 40 个样本，超过 HISTORY_CAP=32：自第 9 个响应起触发
+	// 环形覆写分支（覆写并推进 next），同时验证覆写后的历史仍训练在 ~100。
+	for (let i = 0; i < 10; i++) {
 		await stream(createInstance(true, key), clean(24));
 	}
 	const healthy = await stream(createInstance(true, key), clean(24));
@@ -142,7 +144,9 @@ const clean = (n: number) => Array.from({ length: n }, (_, i) => [50, (i + 1) * 
 	expect(final(shown)! > 1900, `cold start shows a genuine 2000 tok/s (final ${final(shown)})`);
 }
 
-// 诚实抖动不得被低估：周期速率交替 50/200（真实 125）显示须落在 [100,150]
+// 诚实抖动不得被低估：周期速率交替 50/200（真实 125）显示须落在 [100,150]。
+// 注意：本例用全新（冷启动）键，闸门不参与——它只验证估计器本身；闸门
+// 不扭曲诚实抖动这一点已在预热键上单独验证。
 {
 	// 交替的周期速率为 50 与 200 tok/s、每段 1s：真实吞吐是 125 tok/s。
 	// 因此 token 累计量须按每 1000ms 间隔增长 50/200。
