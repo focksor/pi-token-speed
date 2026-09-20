@@ -321,14 +321,18 @@ a delta every 300ms+, so the cycle window could never fill."
 	const healthy = await stream(createInstance(true, key), clean(24));
 	expect(Math.abs(final(healthy)! - 100) < 1, `trained history still shows the true 100 (${final(healthy)})`);
 
+	// MAJORITY pollution: 4 of 8 cycles carry a fat batch, so the median in
+	// Task 1's own rule follows it and only the gate can suppress it. Verified:
+	// without the gate this peaks at 5100, with it at 100. (A 2-cycle fat-chunk
+	// spike is NOT a valid gate test — the cycle rule already handles it.)
 	const steps: Array<[number, number]> = [];
 	let acc = 0;
 	for (let i = 0; i < 24; i++) {
-		acc += 5 + (i === 8 || i === 9 ? 500 : 0);
+		acc += 5 + (i >= 8 && i <= 11 ? 500 : 0);
 		steps.push([50, acc]);
 	}
 	const spiked = await stream(createInstance(true, key), steps);
-	expect(peak(spiked)! <= 150, `trained gate suppresses adjacent fat chunks (peak ${peak(spiked)})`);
+	expect(peak(spiked)! <= 150, `trained gate suppresses majority pollution (peak ${peak(spiked)})`);
 }
 
 // 冷启动不误伤：无历史的键下，真实 2000 tok/s 必须原样显示
@@ -344,7 +348,7 @@ a delta every 300ms+, so the cycle window could never fill."
 - [ ] **Step 2: 运行测试确认失败**
 
 Run: `node test-estimator.ts`
-Expected: FAIL — `trained gate suppresses adjacent fat chunks`（闸门尚未实现，显示到 2600）。
+Expected: FAIL — `trained gate suppresses majority pollution`（闸门尚未实现，显示到 5100）。注：该断言**必须真的失败**；若它在实现闸门之前就通过，说明用例没有考察闸门，需要换形状（Task 1 的周期规则本身已能压掉"2 个相邻肥 chunk"，所以那种形状不能用来验证闸门）。
 
 - [ ] **Step 3: 新增常量与类型**
 
