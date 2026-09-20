@@ -108,6 +108,71 @@ const clean = (n: number) => Array.from({ length: n }, (_, i) => [50, (i + 1) * 
 	expect(peak(shown)! <= 101 && Math.abs(final(shown)! - 100) < 1, `steady 100 shows 100 (${shown.join(",")})`);
 }
 
+// ── 历史环与闸门（通过真实模块的可观察行为验证） ──────────────────────────
+// 训练一个模型键：连续 4 个健康 ~100 tok/s 响应后，闸门应启用；此后一个
+// 20 倍 spike 响应不得把显示推到 5100。
+{
+	const key = { provider: "gate", id: "model-train" };
+	for (let i = 0; i < 6; i++) {
+		await stream(createInstance(true, key), clean(24));
+	}
+	const healthy = await stream(createInstance(true, key), clean(24));
+	expect(Math.abs(final(healthy)! - 100) < 1, `trained history still shows the true 100 (${final(healthy)})`);
+
+	const steps: Array<[number, number]> = [];
+	let acc = 0;
+	for (let i = 0; i < 24; i++) {
+		acc += 5 + (i === 8 || i === 9 ? 500 : 0);
+		steps.push([50, acc]);
+	}
+	const spiked = await stream(createInstance(true, key), steps);
+	expect(peak(spiked)! <= 150, `trained gate suppresses adjacent fat chunks (peak ${peak(spiked)})`);
+}
+
+// 冷启动不误伤：无历史的键下，真实 2000 tok/s 必须原样显示
+{
+	const shown = await stream(
+		createInstance(true, { provider: "gate", id: "cold-fast" }),
+		Array.from({ length: 30 }, (_, i) => [10, (i + 1) * 20] as [number, number]),
+	);
+	expect(final(shown)! > 1900, `cold start shows a genuine 2000 tok/s (final ${final(shown)})`);
+}
+
+// 诚实抖动不得被低估：周期速率交替 50/200（真实 125）显示须落在 [100,150]
+{
+	// 交替的周期速率为 50 与 200 tok/s、每段 1s：真实吞吐是 125 tok/s。
+	// 因此 token 累计量须按每 1000ms 间隔增长 50/200。
+	const steps: Array<[number, number]> = [];
+	let acc = 0;
+	for (let i = 0; i < 12; i++) {
+		acc += i % 2 ? 200 : 50;
+		steps.push([1000, acc]);
+	}
+	const shown = await stream(createInstance(true, { provider: "gate", id: "jitter" }), steps);
+	expect(
+		final(shown)! >= 100 && final(shown)! <= 150,
+		`honest jitter (rates 50/200, true 125) reads ~125, not 50 (final ${final(shown)})`,
+	);
+}
+
+// 超短回复夹紧：1 delta / 50 tok / 250ms 的公式值 192，训练过的键上界 ~280，
+// 故 192 原样显示；而一个远超上界的公式值必须被夹到上界。
+{
+	const key = { provider: "clamp", id: "model" };
+	for (let i = 0; i < 6; i++) await stream(createInstance(true, key), clean(24));
+	const small = await stream(createInstance(true, key), [[250, 50]]);
+	expect(Math.abs(final(small)! - 192) < 2, `short reply within the bound is unchanged (${final(small)})`);
+	await stream(createInstance(true, key), [[200, 1000]]);
+	const big = await stream(createInstance(true, key), [[200, 1000]]);
+	expect(peak(big)! < 600, `an absurd short-reply formula value is clamped to the bound (${peak(big)})`);
+}
+
+// 冷启动：无闸门时不夹紧，公式值原样（与既有行为一致）
+{
+	const shown = await stream(createInstance(true, { provider: "clamp", id: "cold" }), [[200, 1000]]);
+	expect(peak(shown)! > 4000, `cold start does not clamp the formula value (${peak(shown)})`);
+}
+
 performance.now = realNow;
 if (failures > 0) {
 	console.error(`\n${failures} check(s) failed.`);

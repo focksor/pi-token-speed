@@ -34,6 +34,52 @@ const SPEED_MIN_CYCLES = 2;
  */
 const SPEED_MAX_SAMPLES = 512;
 /**
+ * Plausibility gate: a speed outside the model's own observed distribution is
+ * far more likely to be an arrival artifact than a real rate. The bound is
+ * DERIVED FROM HISTORY — never a hardcoded maximum — so a genuinely fast model
+ * is not capped by a constant chosen for a slow one.
+ */
+const HISTORY_CAP = 32;
+/** Samples needed before the gate activates (~3 responses at HISTORY_SEGMENTS). */
+const HISTORY_MIN_SAMPLES = 12;
+/**
+ * Robust samples recorded per response: the response's cycles are split into
+ * this many segments and each segment's median is stored. Segment medians keep
+ * a single spike from moving the history, while still filling the ring fast
+ * enough that the gate activates after a few responses (one sample per response
+ * would take HISTORY_MIN_SAMPLES responses).
+ */
+const HISTORY_SEGMENTS = 4;
+/** Segment count below which a response is too short to be evidence. */
+const HISTORY_MIN_CYCLES = HISTORY_SEGMENTS * 2;
+/**
+ * Robust sigmas above the median before a rate is treated as an artifact.
+ * Together with GATE_SPREAD_FLOOR this lands at roughly 2.8x the median for a
+ * typical history, i.e. wide enough that honest variation is never cut.
+ */
+const GATE_K = 6;
+/** MAD -> sigma consistency factor for a normal distribution. */
+const MAD_TO_SIGMA = 1.4826;
+/**
+ * Spread floor as a fraction of the median, so an unusually tight history
+ * cannot set a razor-thin gate that rejects honest jitter.
+ */
+const GATE_SPREAD_FLOOR = 0.3;
+
+/** One (provider, model)'s observed cycle rates, as a fixed-size ring. */
+interface SpeedHistory {
+	samples: number[];
+	/** Write cursor once `samples` is full. */
+	next: number;
+}
+
+/** A derived plausibility bound: rates above it are arrival artifacts. */
+interface Gate {
+	median: number;
+	bound: number;
+}
+
+/**
  * How long a session's last measured speed keeps counting toward the subagent
  * aggregate after it stops streaming. Without this an agent parked in a long
  * tool phase keeps adding its frozen rate to the sum forever, so a finished
@@ -101,6 +147,8 @@ interface SessionEntry {
 
 interface SharedStore {
 	sessions: Map<string, SessionEntry>;
+	/** Per (provider, model) observed cycle rates — the plausibility gate's input. */
+	history: Map<string, SpeedHistory>;
 	renderers: Set<() => void>;
 	flushScheduled: boolean;
 }
@@ -116,6 +164,7 @@ function getStore(): SharedStore {
 	const previous = holder[STORE_KEY] as Partial<SharedStore> | undefined;
 	const store: SharedStore = {
 		sessions: previous?.sessions instanceof Map ? previous.sessions : new Map(),
+		history: previous?.history instanceof Map ? previous.history : new Map(),
 		renderers: previous?.renderers instanceof Set ? previous.renderers : new Set(),
 		flushScheduled: false,
 	};
@@ -231,17 +280,87 @@ function cycleRates(samples: SpeedSample[], keep: number): number[] {
 }
 
 /**
- * Streaming speed estimate: the median of the recent cycle rates, with a
- * minimum while the window is still small.
- *
- * Returns undefined until SPEED_MIN_CYCLES cycles exist; the caller keeps
- * showing the previous speed until then (see speedTextFor).
+ * History key for the active model. Keyed per model, not per session: the
+ * same provider+model behaves consistently across sessions and subagents,
+ * which is exactly what makes a cross-response distribution meaningful.
  */
-function estimateStreamSpeed(samples: SpeedSample[]): number | undefined {
+function rateKey(ctx: ExtensionContext | undefined): string | undefined {
+	const model = ctx?.model as { provider?: unknown; id?: unknown } | undefined;
+	const provider = typeof model?.provider === "string" ? model.provider : undefined;
+	const id = typeof model?.id === "string" ? model.id : undefined;
+	if (!provider || !id) return undefined;
+	return `${provider}/${id}`;
+}
+
+/**
+ * Record one response's observed rates as HISTORY_SEGMENTS robust samples.
+ *
+ * Uses the response's OWN cycle rates (not the gate-passing subset): a gate fed
+ * only by values it already accepts is a one-way ratchet that can never adapt
+ * upward when the model genuinely gets faster.
+ */
+function recordResponseHistory(store: SharedStore, key: string, samples: SpeedSample[]): void {
+	const rates = cycleRates(samples, SPEED_MAX_SAMPLES);
+	if (rates.length < HISTORY_MIN_CYCLES) return;
+
+	let history = store.history.get(key);
+	if (!history) {
+		history = { samples: [], next: 0 };
+		store.history.set(key, history);
+	}
+	const size = Math.floor(rates.length / HISTORY_SEGMENTS);
+	for (let i = 0; i < HISTORY_SEGMENTS; i++) {
+		const segment = rates.slice(
+			i * size,
+			i === HISTORY_SEGMENTS - 1 ? rates.length : (i + 1) * size,
+		);
+		const value = median(segment);
+		if (value === undefined || !(value > 0)) continue;
+		if (history.samples.length < HISTORY_CAP) history.samples.push(value);
+		else {
+			history.samples[history.next] = value;
+			history.next = (history.next + 1) % HISTORY_CAP;
+		}
+	}
+}
+
+/**
+ * Derive the plausibility bound for a model from its observed rates.
+ * Returns undefined while the history is too small — an unknown model must
+ * never be censored on the basis of "we have not seen it before".
+ *
+ * MAD rather than standard deviation: with 20% of samples at 20x, the bound
+ * moved 212 -> 230 tok/s in measurement, where a standard deviation would be
+ * dragged upward by the very spikes the gate exists to reject.
+ */
+function plausibilityBound(store: SharedStore, key: string | undefined): Gate | undefined {
+	if (key === undefined) return undefined;
+	const history = store.history.get(key);
+	if (!history || history.samples.length < HISTORY_MIN_SAMPLES) return undefined;
+
+	const center = median(history.samples);
+	if (center === undefined || !(center > 0)) return undefined;
+	const deviations = history.samples.map((value) => Math.abs(value - center));
+	const mad = median(deviations) ?? 0;
+	const spread = Math.max(mad * MAD_TO_SIGMA, center * GATE_SPREAD_FLOOR);
+	return { median: center, bound: center + GATE_K * spread };
+}
+
+/**
+ * Streaming speed estimate: the median of the recent cycle rates that pass the
+ * plausibility gate, with a minimum while the window is still small.
+ *
+ * Returns undefined until SPEED_MIN_CYCLES plausible cycles exist; the caller
+ * keeps showing the previous speed until then (see speedTextFor). With no gate
+ * (an unknown model) nothing is filtered — "we have not seen this model" must
+ * never be a reason to censor its speed.
+ */
+function estimateStreamSpeed(samples: SpeedSample[], gate?: Gate): number | undefined {
 	const rates = cycleRates(samples, SPEED_WINDOW);
-	if (rates.length < SPEED_MIN_CYCLES) return undefined;
-	if (rates.length < SPEED_SMALL_WINDOW) return Math.min(...rates);
-	return median(rates);
+	const plausible = gate ? rates.filter((rate) => rate <= gate.bound) : rates;
+	if (plausible.length < SPEED_MIN_CYCLES) return undefined;
+	if (plausible.length < SPEED_SMALL_WINDOW) return Math.min(...plausible);
+	return median(plausible);
 }
 
 /** Append a sample and bound the buffer by COUNT only (see SPEED_MAX_SAMPLES). */
@@ -563,7 +682,10 @@ export default function (pi: ExtensionAPI) {
 			activeResponse.samples,
 			{ at: now - activeResponse.startedAt, tokens: outputTokens },
 		);
-		const speed = estimateStreamSpeed(activeResponse.samples);
+		const speed = estimateStreamSpeed(
+			activeResponse.samples,
+			plausibilityBound(store, rateKey(ctx)),
+		);
 		live = { tokens: outputTokens, speed, ttft };
 		if (speed !== undefined && speed > 0) lastShownSpeed = speed;
 
@@ -600,17 +722,32 @@ export default function (pi: ExtensionAPI) {
 		// so there is no rate to observe) — it is a throughput that includes the
 		// prefill, which is why a 100-token answer that completes in 200ms would
 		// otherwise be reported as hundreds of tok/s and stay on screen.
-		const estimated = estimateStreamSpeed(activeResponse.samples);
+		const gate = plausibilityBound(store, rateKey(ctx));
+		const estimated = estimateStreamSpeed(activeResponse.samples, gate);
+		// A response too short to measure has no observable cycle; fall back to
+		// usage.output / elapsed — which includes the prefill, so it is a
+		// throughput, not a rate. Clamp it to the model's plausible range so a
+		// 200ms/1000-token reply cannot freeze an absurd value on the footer.
+		// With no history there is nothing to clamp against, so it is shown as-is.
+		const formula = tokensPerSecond(outputTokens, activeResponse.startedAt);
 		const speed =
 			estimated !== undefined && estimated > 0
 				? estimated
-				: tokensPerSecond(outputTokens, activeResponse.startedAt);
+				: gate !== undefined
+					? Math.min(formula, gate.bound)
+					: formula;
 		const ttft =
 			activeResponse.requestSentAt !== undefined && activeResponse.firstTokenAt !== undefined
 				? activeResponse.firstTokenAt - activeResponse.requestSentAt
 				: undefined;
 		if (speed > 0) lastShownSpeed = speed;
 		lastFinalMainStatus = `⚡ ${formatSpeed(speed)} tok/s · TTFT ${formatLatency(ttft ?? Number.NaN)}`;
+
+		// Feed the plausibility history before the response state is dropped.
+		const historyKey = rateKey(ctx);
+		if (historyKey !== undefined) {
+			recordResponseHistory(store, historyKey, activeResponse.samples);
+		}
 
 		// A message can end without ever streaming (empty response): the wait
 		// timer must not outlive it.
