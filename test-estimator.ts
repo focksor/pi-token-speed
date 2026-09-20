@@ -194,7 +194,10 @@ const clean = (n: number) => Array.from({ length: n }, (_, i) => [50, (i + 1) * 
 	);
 }
 
-// 粗粒度 provider（>=300ms 间隔）必须能算出速率，而不是因为窗口凑不齐而显示不出数字。
+// 覆盖性断言：粗粒度 provider（>=300ms 间隔）必须能算出速率。
+// 注意本组本身**不具备判别力**——重新引入时间裁剪后它依然通过（裁剪仍保留
+// 恰在 SPEED_MIN_CYCLES 下限的 2 个周期，因此照样报数）；判别力由上面的
+// «one slow cycle» 断言承担。
 for (const [gapMs, chunk] of [
 	[300, 30],
 	[1000, 100],

@@ -694,10 +694,12 @@ Expected: PASS（Task 1 已采用仅按数量的裁剪）。若第一条 `one sl
 
 ```bash
 git add test-estimator.ts
-git commit -m "test: cover coarse-provider measurability
+git commit -m "test: guard coarse-provider estimate quality
 
-Regression guard for the removed time-based sample cutoff: a provider
-emitting a delta every 300ms-2s must still produce a speed reading."
+At the 2-cycle floor a time-based sample cutoff drops the estimator to the
+min rule, letting one stretched cycle dominate the reading (measured: 100
+throughout without it, 50 mid-stream with it). Assert that quality, plus
+coverage that coarse providers still produce a reading."
 ```
 
 ---
