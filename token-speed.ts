@@ -27,10 +27,11 @@ const SPEED_SMALL_WINDOW = 5;
 const SPEED_MIN_CYCLES = 2;
 /**
  * Sample buffer bound. Indices only — there is deliberately NO time-based
- * cutoff: a provider that emits a delta every 300ms+ would leave fewer than
- * SPEED_WINDOW+1 arrivals in any short time window, so the cycle window could
- * never fill and the footer would show no speed at all (measured: 3 arrivals
- * retained under the former 1800ms cutoff).
+ * cutoff. The former 1800ms cutoff left only 3 arrivals for a provider
+ * emitting a delta every 700ms+, i.e. exactly SPEED_MIN_CYCLES, so the
+ * estimator degraded to the min rule and a single stretched cycle dominated
+ * the reading (measured: one 50 tok/s cycle read as 50 instead of 100).
+ * Count-only clipping keeps the full SPEED_WINDOW for any arrival spacing.
  */
 const SPEED_MAX_SAMPLES = 512;
 /**

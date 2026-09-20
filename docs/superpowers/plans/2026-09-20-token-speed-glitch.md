@@ -631,7 +631,7 @@ migration the rest of it uses, and there is no disk IO."
 
 ---
 
-### Task 3: 粗粒度 provider 可测性（验证时间裁剪确已移除）
+### Task 3: 粗粒度 provider 保持估计质量（验证时间裁剪确已移除）
 
 **Files:**
 - Test: `test-estimator.ts`
@@ -640,13 +640,31 @@ migration the rest of it uses, and there is no disk IO."
 - Consumes: Task 1 的 `pushSample`（仅按数量裁剪）、`estimateStreamSpeed`。
 - Produces: 无新接口（纯回归保护）。
 
+> **判别性说明（重要）**：粗粒度 provider 的「能测出速率」本身**不足以**作为回归断言——实测在重新引入 1800ms 时间裁剪后，这些形状依然全部通过（裁剪后仍保留 2 个周期，`SPEED_MIN_CYCLES = 2` 仍然报数）。真正有判别力的是：裁剪只保留 2 个周期时估计器会退化为 min 规则，于是**单个被拉长的慢周期**会主导显示值。本任务的第一条断言即针对该行为（实测：无裁剪全程 100；重新引入裁剪后中间出现 50）。第 2 组断言（能测出速率）只作为覆盖保留。
+
 - [ ] **Step 1: 写测试**
 
 追加：
 
 ```ts
-// 粗粒度 provider：delta 间隔 >= 300ms 时，既有实现的时间裁剪只留 3 个到达，
-// 周期窗口永远凑不齐 -> footer 不显示任何速度。新规则必须能算出来。
+// 粗粒度 provider：一个被拉长的慢周期不得把估计值拖低。
+// 时间裁剪的保留量只够 2 个周期时会退化为「窗口小时取 min」规则，于是单个慢周期
+// 会直接决定显示值；仅按数量裁剪则保留 8 个周期，中位数把它丢弃。
+// 判别性实测：无时间裁剪显示 100 全程；重新引入 1800ms 裁剪后中间出现 50。
+{
+	// 11 个周期：正常 700ms/70 token（100 tok/s），第 7 个周期放慢到 1400ms（50 tok/s）。
+	const gaps = [700, 700, 700, 700, 700, 700, 700, 1400, 700, 700, 700, 700];
+	const steps: Array<[number, number]> = [];
+	let acc = 0;
+	for (const gap of gaps) steps.push([gap, (acc += 70)]);
+	const shown = await stream(createInstance(true, { provider: "coarse", id: "slow-cycle" }), steps);
+	expect(
+		shown.every((value) => value === undefined || value > 90),
+		`one slow cycle does not drag the estimate down (${shown.map((v) => v?.toFixed(0) ?? "-").join(",")})`,
+	);
+}
+
+// 粗粒度 provider（>=300ms 间隔）必须能算出速率，而不是因为窗口凑不齐而显示不出数字。
 for (const [gapMs, chunk] of [
 	[300, 30],
 	[1000, 100],
@@ -670,7 +688,7 @@ for (const [gapMs, chunk] of [
 - [ ] **Step 2: 运行测试**
 
 Run: `node test-estimator.ts`
-Expected: PASS（Task 1 已删除时间裁剪）。若 FAIL，说明时间裁剪仍在，回到 Task 1 Step 4。
+Expected: PASS（Task 1 已采用仅按数量的裁剪）。若第一条 `one slow cycle does not drag the estimate down` 失败，说明时间裁剪被重新引入（它会把保留窗口压到 2 个周期，使 min 规则让单个慢周期主导显示），回到 Task 1 Step 4。
 
 - [ ] **Step 3: 提交**
 
