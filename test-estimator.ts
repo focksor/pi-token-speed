@@ -177,8 +177,24 @@ const clean = (n: number) => Array.from({ length: n }, (_, i) => [50, (i + 1) * 
 	expect(peak(shown)! > 4000, `cold start does not clamp the formula value (${peak(shown)})`);
 }
 
-// 粗粒度 provider：delta 间隔 >= 300ms 时，既有实现的时间裁剪只留 3 个到达，
-// 周期窗口永远凑不齐 -> footer 不显示任何速度。新规则必须能算出来。
+// 粗粒度 provider：一个被拉长的慢周期不得把估计值拖低。
+// 时间裁剪的保留量只够 2 个周期时会退化为「窗口小时取 min」规则，于是单个慢周期
+// 会直接决定显示值；仅按数量裁剪则保留 8 个周期，中位数把它丢弃。
+// 判别性实测：无时间裁剪显示 100 全程；重新引入 1800ms 裁剪后中间出现 50。
+{
+	// 11 个周期：正常 700ms/70 token（100 tok/s），第 7 个周期放慢到 1400ms（50 tok/s）。
+	const gaps = [700, 700, 700, 700, 700, 700, 700, 1400, 700, 700, 700, 700];
+	const steps: Array<[number, number]> = [];
+	let acc = 0;
+	for (const gap of gaps) steps.push([gap, (acc += 70)]);
+	const shown = await stream(createInstance(true, { provider: "coarse", id: "slow-cycle" }), steps);
+	expect(
+		shown.every((value) => value === undefined || value > 90),
+		`one slow cycle does not drag the estimate down (${shown.map((v) => v?.toFixed(0) ?? "-").join(",")})`,
+	);
+}
+
+// 粗粒度 provider（>=300ms 间隔）必须能算出速率，而不是因为窗口凑不齐而显示不出数字。
 for (const [gapMs, chunk] of [
 	[300, 30],
 	[1000, 100],
