@@ -73,7 +73,12 @@ function createInstance(hasUI = true, model?: { provider: string; id: string }) 
 		ui: {
 			setStatus: (_k: string, v?: string) => {
 				if (v === undefined) return;
-				const m = /([\d.]+|\.\.\.) tok\/s/.exec(v)?.[1];
+				// 只读 MAIN 段：subagent 聚合追加在 " · " 之后，其求和值
+				// 绝不能被当作本会话的速度。
+				const main = v.split(" · ").slice(0, 3).join(" · ");
+				const m =
+					/^(?:⚡ )?([\d.]+|\.\.\.) tok\/s/.exec(v.trim())?.[1] ??
+					/([\d.]+|\.\.\.) tok\/s/.exec(main)?.[1];
 				shown.push(m === undefined || m === "..." ? undefined : Number(m));
 			},
 		},
@@ -103,6 +108,9 @@ async function stream(inst: ReturnType<typeof createInstance>, steps: Array<[num
 	}
 	advance(10);
 	await inst.fire("message_end", { message: msg(steps.at(-1)![1]) });
+	// 从共享 store 中清除本会话：残留会话会出现在其他实例的 subagent 聚合段里。
+	await inst.fire("session_shutdown", {});
+	await inst.fire("agent_end", {});
 	return inst.shown;
 }
 
