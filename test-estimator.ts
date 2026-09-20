@@ -119,14 +119,18 @@ const clean = (n: number) => Array.from({ length: n }, (_, i) => [50, (i + 1) * 
 	const healthy = await stream(createInstance(true, key), clean(24));
 	expect(Math.abs(final(healthy)! - 100) < 1, `trained history still shows the true 100 (${final(healthy)})`);
 
+	// MAJORITY pollution: 4 of 8 cycles carry a fat batch, so the median in
+	// Task 1's own rule follows it and only the gate can suppress it. Verified:
+	// without the gate this peaks at 5100, with it at 100. (A 2-cycle fat-chunk
+	// spike is NOT a valid gate test — the cycle rule already handles it.)
 	const steps: Array<[number, number]> = [];
 	let acc = 0;
 	for (let i = 0; i < 24; i++) {
-		acc += 5 + (i === 8 || i === 9 ? 500 : 0);
+		acc += 5 + (i >= 8 && i <= 11 ? 500 : 0);
 		steps.push([50, acc]);
 	}
 	const spiked = await stream(createInstance(true, key), steps);
-	expect(peak(spiked)! <= 150, `trained gate suppresses adjacent fat chunks (peak ${peak(spiked)})`);
+	expect(peak(spiked)! <= 150, `trained gate suppresses majority pollution (peak ${peak(spiked)})`);
 }
 
 // 冷启动不误伤：无历史的键下，真实 2000 tok/s 必须原样显示
