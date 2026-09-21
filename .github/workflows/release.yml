@@ -47,6 +47,10 @@ jobs:
       - name: 功能回归测试
         run: node test-global.ts
 
+      # 发布门禁：估计器回归（虚拟时钟驱动，覆盖周期采样、历史闸门、超短回复夹紧）
+      - name: 估计器回归测试
+        run: node test-estimator.ts
+
       # devDependencies 不入库，仅在发布前临时安装用于类型检查
       - name: TypeScript 严格类型检查
         run: |
