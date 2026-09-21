@@ -313,6 +313,72 @@ for (const [gapMs, chunk] of [
 	);
 }
 
+// ── 首 token 突发：毫秒级周期不得穿透中位数 ───────────────────────────────
+// 真实现场抓到的毛刺（用户实时 footer，冷启动、历史为空）：
+//   ⚡ 81.7 tok/s · TTFT 19.8s…   →   ⚡ 49764 tok/s · TTFT 20.0s   →   ⚡ 121 tok/s
+// 同一个 subagent 段也独立复现（31784 → 30836 → 237）。
+//
+// 机制（已用虚拟时钟精确复现 25050）：长 TTFT 后首 token 以背靠背 delta 到达，
+// 5 个 delta（各 50 tok、间隔 1ms）产生 4 个 50000 tok/s 的周期。到第 8 个周期时
+// 窗口是 [50000,50000,50000,50000, 98,100,100,100]——恰好 8 个，于是 min 规则
+// （仅覆盖 <7）不生效，而非 7 个及以上用中位数：偶数样本时中位数退化为中间两个
+// 的平均 (100+50000)/2 = 25050。
+//
+// 结构性根因：窗口按周期数计，4 个 1ms 周期在时间上只占 4ms，却与 50ms 正常
+// 周期同权，污染因此恰占 50%——正中偶数中位数的最坏点。这也是为何单纯加宽
+// 窗口治不了它（只改变污染占比，不改变同权事实）。
+//
+// 冷启动是关键条件：闸门需 3 个响应才能训练，所以首次响应必须自己能抗。
+{
+	// 20 秒的 TTFT，然后是 5 个 1ms 间隔的突发 delta（各 50 tok），再回到 100 tok/s。
+	const steps: Array<[number, number]> = [];
+	let acc = 0;
+	steps.push([20000, (acc += 50)]);
+	for (let i = 0; i < 4; i++) steps.push([1, (acc += 50)]);
+	for (let i = 0; i < 40; i++) steps.push([50, (acc += 5)]);
+	const shown = await stream(createInstance(true, { provider: "burst", id: "first-token" }), steps);
+	const pk = peak(shown)!;
+	expect(
+		pk <= 150,
+		`first-token burst (5 deltas @1ms) cannot pierce the median (peak ${pk})`,
+	);
+	// 突发之后必须回到真实的 ~100，不得被突发拖高
+	expect(
+		Math.abs(final(shown)! - 100) < 5,
+		`and settles back to the true 100 (final ${final(shown)})`,
+	);
+}
+
+// 同一机制的更小突发（2 个 delta）：改动前不穿透，作为不得引入新回归的对照
+{
+	const steps: Array<[number, number]> = [];
+	let acc = 0;
+	steps.push([5000, (acc += 50)]);
+	steps.push([1, (acc += 50)]);
+	for (let i = 0; i < 40; i++) steps.push([50, (acc += 5)]);
+	const shown = await stream(createInstance(true, { provider: "burst", id: "small" }), steps);
+	expect(peak(shown)! <= 150, `a 2-delta burst stays clean (peak ${peak(shown)})`);
+}
+
+// 突发不只发生在 1ms：间隔越大毛刺越小但仍然显著（实测 2ms→12550、3ms→16667、
+// 5ms→5050、10ms→2550、20ms→2500）。按“绝对时长”过滤只能覆盖 1ms，治不了这些；
+// 逐周期时长加权才能全谱系抑制——本组断言卡住这一点。
+for (const gapMs of [2, 5, 10]) {
+	const steps: Array<[number, number]> = [];
+	let acc = 0;
+	steps.push([10000, (acc += 50)]);
+	for (let i = 0; i < 5; i++) steps.push([gapMs, (acc += 50)]);
+	for (let i = 0; i < 40; i++) steps.push([50, (acc += 5)]);
+	const shown = await stream(
+		createInstance(true, { provider: "burst", id: `gap-${gapMs}` }),
+		steps,
+	);
+	expect(
+		peak(shown)! <= 150,
+		`a 6-delta burst at ${gapMs}ms gaps stays clean (peak ${peak(shown)})`,
+	);
+}
+
 // 平滑度：真实抖动的流不得让显示剧烈础動。
 // 回归对象：SPEED_WINDOW 曾被调到 8，于是每周期 token 数在 3–8 波动、间隔在
 // 45–80ms 波动时，显示会在约 60 tok/s 的范围内摆动、最大偏离真值约 38%（实测均值）。

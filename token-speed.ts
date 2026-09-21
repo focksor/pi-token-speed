@@ -297,6 +297,46 @@ function tokensPerSecond(tokens: number, startedAt: number): number {
 	return tokens / elapsedSeconds;
 }
 
+/**
+ * Median weighted by each cycle's DURATION.
+ *
+ * A count-based median weights a 1ms cycle the same as a 50ms one, so a burst
+ * of back-to-back deltas — the first-token flush after a long TTFT, or a proxy
+ * releasing its buffer — can occupy half the window while representing only a
+ * few milliseconds of actual generation. Measured on a real footer: 5 deltas
+ * 1ms apart drove the display to 49764 tok/s against a true ~100, and the
+ * damage was not limited to 1ms gaps (2ms gaps still read 12550, 5ms read
+ * 5050) because the burst's *rate* is what is enormous, not only its brevity.
+ *
+ * Weighting by span makes the window reflect real elapsed time: the same burst
+ * becomes a negligible fraction of the total weight, so it cannot reach the
+ * middle of the distribution. This preserves the outlier rejection a median
+ * gives while removing the count-based blind spot.
+ */
+function weightedMedian(cycles: Array<{ rate: number; span: number }>): number | undefined {
+	const usable = cycles.filter((cycle) => cycle.span > 0 && Number.isFinite(cycle.rate));
+	if (usable.length === 0) return undefined;
+	const sorted = [...usable].sort((a, b) => a.rate - b.rate);
+	const total = sorted.reduce((sum, cycle) => sum + cycle.span, 0);
+	if (!(total > 0)) return undefined;
+	// At the 50% crossing, return the midpoint of the two straddling rates.
+	// With equal spans this reduces EXACTLY to the plain median (including its
+	// average-of-two-middle-values behavior), so existing, well-understood
+	// behavior is preserved; unequal spans are what the weighting is for.
+	let accumulated = 0;
+	for (let i = 0; i < sorted.length; i++) {
+		const before = accumulated;
+		accumulated += sorted[i].span;
+		if (accumulated > total / 2) {
+			if (before < total / 2) return sorted[i].rate;
+			// Landed exactly on the boundary: average with the previous rate.
+			const previous = sorted[i - 1];
+			return previous ? (previous.rate + sorted[i].rate) / 2 : sorted[i].rate;
+		}
+	}
+	return sorted[sorted.length - 1]?.rate;
+}
+
 function median(values: number[]): number {
 	const sorted = [...values].sort((a, b) => a - b);
 	const mid = sorted.length >> 1;
@@ -312,7 +352,7 @@ function median(values: number[]): number {
  * former bucketing had to absorb them, which either flickered to 0 or (if
  * dropped) inflated by the reciprocal of the content ratio.
  */
-function cycleRates(samples: SpeedSample[], keep: number): number[] {
+function cycleRates(samples: SpeedSample[], keep: number): Array<{ rate: number; span: number }> {
 	// Indices of arrivals that carry tokens (the first sample counts only if
 	// it already does — the initial message_start sample never does).
 	const content: number[] = [];
@@ -322,7 +362,7 @@ function cycleRates(samples: SpeedSample[], keep: number): number[] {
 		if (grew) content.push(i);
 	}
 
-	const rates: number[] = [];
+	const rates: Array<{ rate: number; span: number }> = [];
 	const from = Math.max(1, content.length - keep);
 	for (let k = from; k < content.length; k++) {
 		const prev = samples[content[k - 1]];
@@ -330,7 +370,7 @@ function cycleRates(samples: SpeedSample[], keep: number): number[] {
 		const span = cur.at - prev.at;
 		if (span <= 0) continue;
 		// Clamp: a message rewritten mid-stream can lower the partial count.
-		rates.push((Math.max(cur.tokens - prev.tokens, 0) / span) * 1000);
+		rates.push({ rate: (Math.max(cur.tokens - prev.tokens, 0) / span) * 1000, span });
 	}
 	return rates;
 }
@@ -358,17 +398,18 @@ function rateKey(ctx: ExtensionContext | undefined): string | undefined {
 function recordResponseHistory(store: SharedStore, key: string, samples: SpeedSample[]): void {
 	const rates = cycleRates(samples, SPEED_MAX_SAMPLES);
 	if (rates.length < HISTORY_MIN_CYCLES) return;
+	const cycleValues = rates.map((cycle) => cycle.rate);
 
 	let history = store.history.get(key);
 	if (!history) {
 		history = { samples: [], next: 0 };
 		store.history.set(key, history);
 	}
-	const size = Math.floor(rates.length / HISTORY_SEGMENTS);
+	const size = Math.floor(cycleValues.length / HISTORY_SEGMENTS);
 	for (let i = 0; i < HISTORY_SEGMENTS; i++) {
-		const segment = rates.slice(
+		const segment = cycleValues.slice(
 			i * size,
-			i === HISTORY_SEGMENTS - 1 ? rates.length : (i + 1) * size,
+			i === HISTORY_SEGMENTS - 1 ? cycleValues.length : (i + 1) * size,
 		);
 		const value = median(segment);
 		if (value === undefined || !(value > 0)) continue;
@@ -413,10 +454,18 @@ function plausibilityBound(store: SharedStore, key: string | undefined): Gate | 
  */
 function estimateStreamSpeed(samples: SpeedSample[], gate?: Gate): number | undefined {
 	const rates = cycleRates(samples, SPEED_WINDOW);
-	const plausible = gate ? rates.filter((rate) => rate <= gate.bound) : rates;
+	const plausible = gate ? rates.filter((cycle) => cycle.rate <= gate.bound) : rates;
 	if (plausible.length < SPEED_MIN_CYCLES) return undefined;
-	if (plausible.length < SPEED_SMALL_WINDOW) return Math.min(...plausible);
-	return median(plausible);
+	// Small window: the minimum is the only honest reading (same reason as
+	// before — a median needs outliers to stay a minority, and rank is
+	// meaningless while there are too few cycles to rank).
+	if (plausible.length < SPEED_SMALL_WINDOW) {
+		const lightest = Math.min(...plausible.map((cycle) => cycle.rate));
+		return lightest;
+	}
+	const weighted = weightedMedian(plausible);
+	if (weighted !== undefined) return weighted;
+	return median(plausible.map((cycle) => cycle.rate));
 }
 
 /** Append a sample and bound the buffer by COUNT only (see SPEED_MAX_SAMPLES). */
