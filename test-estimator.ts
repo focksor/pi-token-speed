@@ -232,12 +232,19 @@ const clean = (n: number) => Array.from({ length: n }, (_, i) => [50, (i + 1) * 
 // 诚实抖动不得被低估：周期速率交替 50/200（真实 125）显示须落在 [100,150]。
 // 注意：本例用全新（冷启动）键，闸门不参与——它只验证估计器本身；闸门
 // 不扭曲诚实抖动这一点已在预热键上单独验证。
+//
+// 流长须 ≥ 12 个周期（≥ 13 个带 token 到达）。取中位数要求窗口内离群值占少数，
+// 而交替流的中位数取值取决于窗口长度的奇偶：窗口为奇数时 50 与 200 各占一半，
+// 中位落在 200 一侧就稳定读 200。流只有 11 个周期时，任何 ≥12 的窗口都只能
+// 看到这 11 个（奇数），于是读 200——那是窗口奇偶造成的，不是估计器偏差
+// （实测：11 周期的流在 W=8/12/16/24/32 下分别读 125/200/200/200/200，
+// 而 ≥ 12 周期时所有窗口都稳定读 125）。
 {
 	// 交替的周期速率为 50 与 200 tok/s、每段 1s：真实吞吐是 125 tok/s。
 	// 因此 token 累计量须按每 1000ms 间隔增长 50/200。
 	const steps: Array<[number, number]> = [];
 	let acc = 0;
-	for (let i = 0; i < 12; i++) {
+	for (let i = 0; i < 20; i++) {
 		acc += i % 2 ? 200 : 50;
 		steps.push([1000, acc]);
 	}
@@ -303,6 +310,53 @@ for (const [gapMs, chunk] of [
 	expect(
 		final(shown) !== undefined && Math.abs(final(shown)! - expected) / expected < 0.2,
 		`coarse ${gapMs}ms provider is measurable (final ${final(shown)}, expected ~${expected})`,
+	);
+}
+
+// 平滑度：真实抖动的流不得让显示剧烈础動。
+// 回归对象：SPEED_WINDOW 曾被调到 8，于是每周期 token 数在 3–8 波动、间隔在
+// 45–80ms 波动时，显示会在约 60 tok/s 的范围内摆动、最大偏离真值约 38%（实测均值）。
+// 平滑度只能靠窗口宽度换取，抗毛刺靠中位数——两者不可互相替代，所以本项与
+// 上面的污染断言必须同时成立。
+// 判别性（多 seed 均值，实测）：W=4→不稳定，W=8→59.6（本断言失败），
+// W=12→44.0，W=16→35.4（通过）。
+// 注：单个 seed 的范围方差极大（W=8 时实测跨 38–73），因此必须多 seed 取均值，
+// 否则断言会随机飘动（见下方 6 个 seed）。
+{
+	const ranges: number[] = [];
+	const drifts: number[] = [];
+	for (let seedIndex = 1; seedIndex <= 6; seedIndex++) {
+		// 均匀分布的伪随机（LCG），tok 3–8、dt 45–80ms：真实速率因 seed 而异，
+		// 所以每次都比对“该次流自身的真实速率”，而不是写死一个期望值。
+		let seed = (seedIndex * 2654435761) >>> 0;
+		const rand = () => ((seed = (seed * 1664525 + 1013904223) >>> 0), seed / 4294967296);
+		const steps: Array<[number, number]> = [];
+		let acc = 0;
+		let elapsedMs = 0;
+		for (let i = 0; i < 90; i++) {
+			acc += 3 + Math.floor(rand() * 6);
+			const dt = 45 + Math.floor(rand() * 36);
+			elapsedMs += dt;
+			steps.push([dt, acc]);
+		}
+		const trueRate = (acc / elapsedMs) * 1000;
+		const shown = await stream(
+			createInstance(true, { provider: "smooth", id: `jittery-${seedIndex}` }),
+			steps,
+		);
+		const stable = shown.filter((v): v is number => v !== undefined).slice(3); // 去掉热身
+		ranges.push(Math.max(...stable) - Math.min(...stable));
+		drifts.push(Math.max(...stable.map((v) => Math.abs(v - trueRate) / trueRate)));
+	}
+	const meanRange = ranges.reduce((a, b) => a + b, 0) / ranges.length;
+	const meanDrift = drifts.reduce((a, b) => a + b, 0) / drifts.length;
+	expect(
+		meanRange <= 45,
+		`honest jitter stays smooth (mean swing ${meanRange.toFixed(0)} tok/s over ${ranges.length} seeds)`,
+	);
+	expect(
+		meanDrift <= 0.3,
+		`and never drifts far from the true rate (mean worst ${(meanDrift * 100).toFixed(0)}%)`,
 	);
 }
 

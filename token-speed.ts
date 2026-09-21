@@ -14,8 +14,23 @@ const MAX_LABEL_WIDTH = 16;
  * A cycle is measured between two token-carrying arrivals, so a fat delta can
  * only ever pollute its own cycle instead of a wall-clock bucket that mixes a
  * stall with several bursts.
+ *
+ * Sized for SMOOTHNESS, not just glitch rejection: with an 8-cycle window the
+ * display of an honestly jittery stream (3-8 tokens per 45-80ms cycle, true 87
+ * tok/s) swung over a 57 tok/s range and drifted up to 37% off the true rate
+ * (measured, virtual clock). At 16 cycles the same stream swings over 38 and
+ * drifts at most 25%, a third less wobble, while a genuine step still lands in
+ * 400ms of displayed history (200ms at 8).
+ *
+ * Why not wider: past ~16 cycles the extra smoothing buys nothing for glitch
+ * rejection and only costs responsiveness (24 cycles -> 600ms, 32 -> 800ms).
+ * Why not the 5s time-window that oh-my-tps/opencode-tps use: a window that
+ * averages tokens-over-time is a MEAN, so it loses the outlier rejection a
+ * median provides — measured, it silently drops both the 4/8-pollution and
+ * thinking-burst cases this estimator must survive, and shows nothing at all
+ * for responses shorter than its 2s floor.
  */
-const SPEED_WINDOW = 8;
+const SPEED_WINDOW = 16;
 /**
  * Below this many cycles the window takes the MINIMUM instead of the median.
  * A median only discards outliers while they stay a minority; with a 3-cycle
