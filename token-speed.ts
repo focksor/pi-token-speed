@@ -21,8 +21,15 @@ const SPEED_WINDOW = 8;
  * A median only discards outliers while they stay a minority; with a 3-cycle
  * window two polluted cycles already carry it (measured: 2600 tok/s against a
  * true 100). The minimum is the only honest reading when data is scarce.
+ *
+ * Set to 7 rather than 5 because a 5-6 cycle window is still a minority-margin
+ * window: 3 polluted cycles in an early 8-cycle window carried the median to
+ * 10100 (measured), and only the min rule suppresses that. The wider rule is
+ * deliberately conservative — it can read LOW while the window fills, never
+ * HIGH. Cost is bounded to the first 6 cycles of a response; steady state is
+ * unaffected (a 12-cycle 50/200 jitter stream still reads the true 125).
  */
-const SPEED_SMALL_WINDOW = 5;
+const SPEED_SMALL_WINDOW = 7;
 /** Fewest cycles that can produce a rate at all (2 intervals = 3 arrivals). */
 const SPEED_MIN_CYCLES = 2;
 /**
@@ -41,18 +48,51 @@ const SPEED_MAX_SAMPLES = 512;
  * is not capped by a constant chosen for a slow one.
  */
 const HISTORY_CAP = 32;
-/** Samples needed before the gate activates (~3 responses at HISTORY_SEGMENTS). */
+/**
+ * Samples needed before the gate activates. A response contributing at least
+ * HISTORY_MIN_CYCLES cycles writes HISTORY_SEGMENTS samples, so activation is
+ * 3 responses at any delivery granularity — measured: 4, 6, 8, 16 and 24
+ * cycles per response all activate on the 3rd response, and a 3-cycle response
+ * contributes nothing.
+ */
 const HISTORY_MIN_SAMPLES = 12;
 /**
  * Robust samples recorded per response: the response's cycles are split into
- * this many segments and each segment's median is stored. Segment medians keep
- * a single spike from moving the history, while still filling the ring fast
- * enough that the gate activates after a few responses (one sample per response
- * would take HISTORY_MIN_SAMPLES responses).
+ * this many segments and each segment's median is stored, so a single spike
+ * cannot move the history while the ring still fills fast enough that the gate
+ * activates after a few responses (one sample per response would take
+ * HISTORY_MIN_SAMPLES responses).
+ *
+ * A response with fewer cycles than segments splits into one-cycle segments.
+ * That is correct, not a shortcut: robustness here comes from the median over
+ * the whole ring (many samples per key), not from within-segment medians, and
+ * a one-cycle segment faithfully preserves the sampled distribution. Forced
+ * pairing is actively harmful — with 4 cycles and 1 spike, 2-cycle segments
+ * put a spike and an honest cycle in the same pair, manufacturing a polluted
+ * sample whose median lies between them (measured: a 1-in-4 spike trained the
+ * gate bound 280 -> 24839, i.e. the gate stopped gating).
+ *
+ * For long responses (>= 8 cycles here) segments are long enough that their
+ * medians do discard spikes, which is where that protection actually applies.
  */
 const HISTORY_SEGMENTS = 4;
-/** Segment count below which a response is too short to be evidence. */
-const HISTORY_MIN_CYCLES = HISTORY_SEGMENTS * 2;
+/**
+ * Fewest cycles that make a response evidence at all.
+ *
+ * Counting CYCLES rather than chunks is what a delivery-granularity-agnostic
+ * rule requires. The former value (HISTORY_SEGMENTS * 2 = 8) silently assumed
+ * fine-grained delivery: a provider emitting one delta every 700ms+ produces
+ * only ~3 cycles in a long response, so its history stayed empty FOREVER and
+ * the gate never activated (measured: 12 trained responses then 3/6 pollution
+ * still peaked at 10100 against a true 100). Such a provider is exactly the
+ * coarse gateway batching this extension must survive.
+ *
+ * Kept at 4 — one cycle per segment, since HISTORY_SEGMENTS is 4 — because a
+ * short response must stay splittable into HISTORY_SEGMENTS non-empty parts.
+ * Do NOT raise segments above the cycle count: an EMPTY segment's median is
+ * undefined and is silently skipped, which would quietly under-sample.
+ */
+const HISTORY_MIN_CYCLES = 4;
 /**
  * Robust sigmas above the median before a rate is treated as an artifact.
  * Together with GATE_SPREAD_FLOOR this lands at roughly 2.8x the median for a

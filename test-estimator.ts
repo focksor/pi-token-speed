@@ -135,6 +135,91 @@ const clean = (n: number) => Array.from({ length: n }, (_, i) => [50, (i + 1) * 
 	expect(peak(spiked)! <= 150, `trained gate suppresses majority pollution (peak ${peak(spiked)})`);
 }
 
+// ── 交付粒度无关性：闸门必须能被“少 chunk”的 provider 训练 ────────────────
+// 回归对象：HISTORY_MIN_CYCLES 曾等于 HISTORY_SEGMENTS * 2 = 8，于是每响应少于 8
+// 个周期的 provider 永远写不进历史，闸门永不启用。网关攒批（代理转发）正是这种
+// 交付形态，也是本扩展要活下来的场景。6 周期/响应下要触发历史写入分支，本项
+// 在旧常量下必须失败（实测 peak 10100，真实 100）。
+{
+	const key = { provider: "granular", id: "coarse-delivery" };
+	// 健康响应：6 个周期（7 个带 token 到达）@ 100 tok/s
+	const shortHealthy = (i: number) => [50, (i + 1) * 5] as [number, number];
+	for (let i = 0; i < 12; i++) {
+		await stream(createInstance(true, key), Array.from({ length: 7 }, (_, i) => shortHealthy(i)));
+	}
+	// 同键、同交付粒度下遇 3/6 污染（半数）：只有闸门能抑制它
+	const steps: Array<[number, number]> = [];
+	let acc = 0;
+	for (let i = 0; i < 7; i++) {
+		acc += 5 + (i >= 1 && i <= 3 ? 500 : 0);
+		steps.push([50, acc]);
+	}
+	const spiked = await stream(createInstance(true, key), steps);
+	expect(
+		peak(spiked)! <= 150,
+		`coarse-delivery provider can train the gate (peak ${peak(spiked)} vs true 100)`,
+	);
+	// 反向护栏：闸门被训练后，同键的诚实 100 不得被压或被抬
+	const honest = await stream(
+		createInstance(true, key),
+		Array.from({ length: 25 }, (_, i) => [50, (i + 1) * 5] as [number, number]),
+	);
+	expect(
+		final(honest)! >= 90 && final(honest)! <= 120,
+		`and still reads the true 100 honestly (final ${final(honest)})`,
+	);
+}
+
+// 冷启动早期污染：无历史时，前段 3/8 个周期被肥 chunk 污染。旧规则在 8 周期
+// 窗口下用中位数，3 个污染周期不足以占多数但足以带跑早期窗口（实测 5100）。
+// 本项在 SPEED_SMALL_WINDOW=5 下必须失败。
+{
+	const steps: Array<[number, number]> = [];
+	let acc = 0;
+	for (let i = 0; i < 24; i++) {
+		acc += 5 + (i >= 2 && i <= 4 ? 500 : 0);
+		steps.push([50, acc]);
+	}
+	const shown = await stream(createInstance(true, { provider: "p", id: "cold-early-3" }), steps);
+	expect(peak(shown)! <= 150, `cold start survives 3/8 early pollution (peak ${peak(shown)})`);
+}
+
+// 护栏：用“每个短响应都带一坨”的响应训练，不得把闸门抬高 —— 少数 spike 必须仍是少数。
+// 本项有判别力：曾试验过“把 4 周期响应的相邻周期强行配对成 2 段”（每段 2 个周期），
+// 配对会把 1 个 spike 和 1 个诚实周期混在一起，制出一个落在二者之间的污染样本，
+// 实测闸门上界从 280 涨到 24839（等于不再设防）。改为逐周期分段后本项通过。
+{
+	const key = { provider: "granular", id: "poisoned-training" };
+	for (let i = 0; i < 8; i++) {
+		// 4 周期响应，仅 1 个周期带重 chunk（污染占少数），位置轮换以免永远落在同一段
+		const spikeAt = 1 + (i % 3);
+		const steps: Array<[number, number]> = [];
+		let acc = 0;
+		for (let j = 0; j < 5; j++) {
+			acc += 5 + (j === spikeAt ? 500 : 0);
+			steps.push([50, acc]);
+		}
+		await stream(createInstance(true, key), steps);
+	}
+	// 训练后闸门必须仍然“紧”：4/8 污染仍需被昂到 ~100
+	const bad: Array<[number, number]> = [];
+	let acc = 0;
+	for (let i = 0; i < 25; i++) {
+		acc += 5 + (i >= 8 && i <= 11 ? 500 : 0);
+		bad.push([50, acc]);
+	}
+	const spiked = await stream(createInstance(true, key), bad);
+	expect(peak(spiked)! <= 150, `minority spikes stay a minority in history (peak ${peak(spiked)})`);
+	const honest = await stream(
+		createInstance(true, key),
+		Array.from({ length: 25 }, (_, i) => [50, (i + 1) * 5] as [number, number]),
+	);
+	expect(
+		final(honest)! >= 90 && final(honest)! <= 120,
+		`and honest 100 is not clipped by the trained gate (final ${final(honest)})`,
+	);
+}
+
 // 冷启动不误伤：无历史的键下，真实 2000 tok/s 必须原样显示
 {
 	const shown = await stream(
