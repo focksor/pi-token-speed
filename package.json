@@ -1,6 +1,6 @@
 {
   "name": "@focksor/pi-token-speed",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "pi extension: show assistant output token speed and TTFT in the footer, aggregated across in-process subagents",
   "type": "module",
   "license": "MIT",
