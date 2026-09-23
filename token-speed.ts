@@ -179,7 +179,8 @@ interface SessionEntry {
 	label?: string;
 	running: boolean;
 	speed?: number;
-	/** Last measured (post-estimator) speed for this session — shown when it is
+	/** Last speed for this session: the live estimate while streaming, then the
+	 *  final post-TTFT average once message_end fires — shown when the session is
 	 *  not currently streaming, mirroring the main session's persist-last-final
 	 *  behavior. Cleared implicitly when the entry is removed (agent end). */
 	lastSpeed?: number;
@@ -816,19 +817,50 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		const nowMs = performance.now();
 		const outputTokens = getOutputTokens(message);
 		pushSample(
 			activeResponse.samples,
-			{ at: performance.now() - activeResponse.startedAt, tokens: outputTokens },
+			{ at: nowMs - activeResponse.startedAt, tokens: outputTokens },
 		);
-		// Final speed: the same estimator the streaming display used, so the number
-		// the user was reading does not jump at the end. `usage.output / elapsed` is
-		// only a fallback for a response that was too short to measure (one delta,
-		// so there is no rate to observe) — it is a throughput that includes the
-		// prefill, which is why a 100-token answer that completes in 200ms would
-		// otherwise be reported as hundreds of tok/s and stay on screen.
 		const gate = plausibilityBound(store, rateKey(ctx));
 		const estimated = estimateStreamSpeed(activeResponse.samples, gate);
+
+		// Final speed: the average over the whole post-TTFT window, NOT the tail
+		// reading the live estimator last showed. A stream that decelerates (or
+		// stalls) at the end leaves the window median parked at the slow tail rate,
+		// and freezing THAT misquotes the response; tokens-over-post-TTFT-time is
+		// the honest whole-response rate. The numerator excludes the first
+		// arrival's tokens: they were generated inside the TTFT window, so counting
+		// them against post-TTFT time would credit coarse deliveries (one fat
+		// delta per 700ms+) a whole free chunk. Requiring streamedTokens > 0 is
+		// exactly "the response had >= 2 token-carrying arrivals" — a single-delta
+		// response has no post-TTFT window worth measuring and keeps the fallback.
+		let firstArrivalTokens: number | undefined;
+		for (let i = 0; i < activeResponse.samples.length; i++) {
+			const grew =
+				i === 0
+					? activeResponse.samples[i].tokens > 0
+					: activeResponse.samples[i].tokens > activeResponse.samples[i - 1].tokens;
+			if (grew) {
+				firstArrivalTokens = activeResponse.samples[i].tokens;
+				break;
+			}
+		}
+		const streamedTokens =
+			firstArrivalTokens !== undefined ? outputTokens - firstArrivalTokens : 0;
+		const streamedMs =
+			activeResponse.firstTokenAt !== undefined
+				? Math.max(nowMs - activeResponse.firstTokenAt, 0)
+				: 0;
+		const average =
+			streamedMs > 0 && streamedTokens > 0 ? streamedTokens / (streamedMs / 1000) : undefined;
+		// An average above the gate bound (cold-start fat batches, mostly) is an
+		// arrival artifact, not a speed: it drops out of the chain so the robust
+		// streaming reading — what the user was watching — is kept, and the bound
+		// itself is never displayed as a rate.
+		const plausibleAverage =
+			gate !== undefined && average !== undefined && average > gate.bound ? undefined : average;
 		// A response too short to measure has no observable cycle; fall back to
 		// usage.output / elapsed — which includes the prefill, so it is a
 		// throughput, not a rate. Clamp it to the model's plausible range so a
@@ -836,11 +868,13 @@ export default function (pi: ExtensionAPI) {
 		// With no history there is nothing to clamp against, so it is shown as-is.
 		const formula = tokensPerSecond(outputTokens, activeResponse.startedAt);
 		const speed =
-			estimated !== undefined && estimated > 0
-				? estimated
-				: gate !== undefined
-					? Math.min(formula, gate.bound)
-					: formula;
+			plausibleAverage !== undefined && plausibleAverage > 0
+				? plausibleAverage
+				: estimated !== undefined && estimated > 0
+					? estimated
+					: gate !== undefined
+						? Math.min(formula, gate.bound)
+						: formula;
 		const ttft =
 			activeResponse.requestSentAt !== undefined && activeResponse.firstTokenAt !== undefined
 				? activeResponse.firstTokenAt - activeResponse.requestSentAt
@@ -864,8 +898,14 @@ export default function (pi: ExtensionAPI) {
 		lastLiveRenderAt = -Infinity;
 		lastReportAt = -Infinity;
 		// Still running (more turns may follow) — just no longer streaming.
-		// Clearing the current speed also stamps the aggregate expiry clock.
-		touch({ speed: undefined });
+		// Clearing the current speed also stamps the aggregate expiry clock; the
+		// aggregate's briefly-persisted lastSpeed becomes the FINAL average — the
+		// same number the main footer froze — never the streaming tail value.
+		touch(
+			speed > 0
+				? { speed: undefined, lastSpeed: speed, speedAt: performance.now() }
+				: { speed: undefined },
+		);
 		render(true);
 		// The aggregate changed for the footer owner (if this isn't it).
 		scheduleFlush(store);

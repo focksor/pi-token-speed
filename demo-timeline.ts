@@ -5,7 +5,8 @@
  *
  * Watch for:
  *   response 1: TTFT wait timer → TTFT freezes → bucketed-median speed settles
- *   response 2: the previous response's speed is kept through the wait
+ *               → at message_end the footer freezes to the post-TTFT average
+ *   response 2: the previous response's final speed is kept through the wait
  *
  * Run: node demo-timeline.ts
  */

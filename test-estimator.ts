@@ -85,11 +85,23 @@ const peak = (xs: Array<number | undefined>) => {
 	const v = xs.filter((x): x is number => x !== undefined);
 	return v.length ? Math.max(...v) : undefined;
 };
+// message_end 定格的最终值是序列末尾的元素（直接 render + flush 会推两份）；
+// 流式峰值必须排除末尾整个重复段——最终值现在是 TTFT 后全程平均，
+// 可能（如实）高于流式期间的所有读数。
+const streamPeak = (xs: Array<number | undefined>) => {
+	const last = xs.at(-1);
+	let end = xs.length;
+	while (end > 0 && xs[end - 1] === last) end--;
+	return peak(xs.slice(0, end));
+};
 const final = (xs: Array<number | undefined>) => xs.filter((x): x is number => x !== undefined).at(-1);
 
 const clean = (n: number) => Array.from({ length: n }, (_, i) => [50, (i + 1) * 5] as [number, number]);
 
-// [regression] 早期窗口被两个相邻肥 chunk 污染：既有实现显示 5100，新规则须为 100
+// [regression] 早期窗口被两个相邻肥 chunk 污染：既有实现显示 5100，新规则须为 100。
+// 流式期间不得出现离谱读数；定格的最终值则是 TTFT 后全程平均——冷启动无闸门不夹紧，
+// 肥 chunk 的 token 真实到达，均值如实包含它们（预期语义，非污染）：
+// (24×5 + 2×500 − 首 arrival 5) / 1.16s ≈ 961。
 {
 	const steps: Array<[number, number]> = [];
 	let acc = 0;
@@ -98,8 +110,14 @@ const clean = (n: number) => Array.from({ length: n }, (_, i) => [50, (i + 1) * 
 		steps.push([50, acc]);
 	}
 	const shown = await stream(createInstance(true, { provider: "p", id: "cold-early" }), steps);
-	expect(peak(shown)! <= 150, `early adjacent fat chunks stay near 100 (peak ${peak(shown)})`);
-	expect(Math.abs(final(shown)! - 100) < 1, `and settle at 100 (final ${final(shown)})`);
+	expect(
+		streamPeak(shown)! <= 150,
+		`early adjacent fat chunks stay near 100 while streaming (peak ${streamPeak(shown)})`,
+	);
+	expect(
+		Math.abs(final(shown)! - (24 * 5 + 2 * 500 - 5) / 1.16) < 2,
+		`final freezes to the post-TTFT average (${final(shown)} ≈ ${((24 * 5 + 2 * 500 - 5) / 1.16).toFixed(0)})`,
+	);
 }
 
 // 稳态无污染：必须如实显示 100
@@ -133,6 +151,12 @@ const clean = (n: number) => Array.from({ length: n }, (_, i) => [50, (i + 1) * 
 	}
 	const spiked = await stream(createInstance(true, key), steps);
 	expect(peak(spiked)! <= 150, `trained gate suppresses majority pollution (peak ${peak(spiked)})`);
+	// 平均值 (2115/1.16 ≈ 1823) 超出闸门上界 (~280)：定格值回退为流式估计，
+	// 而不是把上界本身当作速度显示。
+	expect(
+		Math.abs(final(spiked)! - 100) < 2,
+		`an above-bound average falls back to the streaming estimate, not the bound (final ${final(spiked)})`,
+	);
 }
 
 // ── 交付粒度无关性：闸门必须能被“少 chunk”的 provider 训练 ────────────────
@@ -173,6 +197,7 @@ const clean = (n: number) => Array.from({ length: n }, (_, i) => [50, (i + 1) * 
 // 冷启动早期污染：无历史时，前段 3/8 个周期被肥 chunk 污染。旧规则在 8 周期
 // 窗口下用中位数，3 个污染周期不足以占多数但足以带跑早期窗口（实测 5100）。
 // 本项在 SPEED_SMALL_WINDOW=5 下必须失败。
+// 流式期间不得出现离谱读数；定格值为冷启动下如实的全程平均。
 {
 	const steps: Array<[number, number]> = [];
 	let acc = 0;
@@ -181,7 +206,15 @@ const clean = (n: number) => Array.from({ length: n }, (_, i) => [50, (i + 1) * 
 		steps.push([50, acc]);
 	}
 	const shown = await stream(createInstance(true, { provider: "p", id: "cold-early-3" }), steps);
-	expect(peak(shown)! <= 150, `cold start survives 3/8 early pollution (peak ${peak(shown)})`);
+	expect(
+		streamPeak(shown)! <= 150,
+		`cold start survives 3/8 early pollution while streaming (peak ${streamPeak(shown)})`,
+	);
+	// 定格值 = 冷启动下如实显示的全程平均：(24×5 + 3×500 − 5)/1.16 ≈ 1392。
+	expect(
+		Math.abs(final(shown)! - (24 * 5 + 3 * 500 - 5) / 1.16) < 2,
+		`final freezes to the honest post-TTFT average (${final(shown)})`,
+	);
 }
 
 // 护栏：用“每个短响应都带一坨”的响应训练，不得把闸门抬高 —— 少数 spike 必须仍是少数。
@@ -337,15 +370,16 @@ for (const [gapMs, chunk] of [
 	for (let i = 0; i < 4; i++) steps.push([1, (acc += 50)]);
 	for (let i = 0; i < 40; i++) steps.push([50, (acc += 5)]);
 	const shown = await stream(createInstance(true, { provider: "burst", id: "first-token" }), steps);
-	const pk = peak(shown)!;
+	const pk = streamPeak(shown)!;
 	expect(
 		pk <= 150,
-		`first-token burst (5 deltas @1ms) cannot pierce the median (peak ${pk})`,
+		`first-token burst (5 deltas @1ms) cannot pierce the median while streaming (peak ${pk})`,
 	);
-	// 突发之后必须回到真实的 ~100，不得被突发拖高
+	// 突发后实时值回到真实的 ~100；定格值则是 TTFT 后全程平均：(450−50)/2.014 ≈ 199 ——
+	// 突发的 200 个 token 真实到达，均值如实包含它们（预期语义，非污染）。
 	expect(
-		Math.abs(final(shown)! - 100) < 5,
-		`and settles back to the true 100 (final ${final(shown)})`,
+		Math.abs(final(shown)! - 400 / 2.014) < 2,
+		`final freezes to the post-TTFT average including the burst (${final(shown)} ≈ ${(400 / 2.014).toFixed(0)})`,
 	);
 }
 
@@ -374,8 +408,34 @@ for (const gapMs of [2, 5, 10]) {
 		steps,
 	);
 	expect(
-		peak(shown)! <= 150,
-		`a 6-delta burst at ${gapMs}ms gaps stays clean (peak ${peak(shown)})`,
+		streamPeak(shown)! <= 150,
+		`a 6-delta burst at ${gapMs}ms gaps stays clean while streaming (peak ${streamPeak(shown)})`,
+	);
+	// 定格值 = TTFT 后全程平均（含突发批次真实到达的 token，约 220）：预期语义。
+	expect(
+		final(shown)! > 180 && final(shown)! < 260,
+		`final freezes to the honest post-TTFT average (${final(shown)})`,
+	);
+}
+
+// ── 最终速度语义：尾部减速时定格全程平均，而非尾值 ──────────────────────
+// 本优化的核心回归。长响应尾部减速（最后 8 个周期降到 20 tok/s）时，流式估计器
+// 会停在 ~60（尾段慢周期占满半个窗口），旧实现把这个尾值定格；新实现定格为
+// TTFT 后全程平均：(16×5 + 8×1 − 5)/1.16 ≈ 71.6 —— 与“这个响应到底多快”一致。
+{
+	const key = { provider: "final", id: "tail-stall" };
+	// 预训练闸门：均值 71.6 远低于上界，走“直接显示平均值”的主路径
+	for (let i = 0; i < 4; i++) await stream(createInstance(true, key), clean(24));
+	const steps: Array<[number, number]> = [];
+	let acc = 0;
+	for (let i = 0; i < 24; i++) {
+		acc += i < 16 ? 5 : 1;
+		steps.push([50, acc]);
+	}
+	const shown = await stream(createInstance(true, key), steps);
+	expect(
+		Math.abs(final(shown)! - (16 * 5 + 8 * 1 - 5) / 1.16) < 2,
+		`a decelerating tail freezes to the whole-response average, not the tail rate (${final(shown)} ≈ ${((16 * 5 + 8 * 1 - 5) / 1.16).toFixed(1)})`,
 	);
 }
 
